@@ -56,6 +56,7 @@ def test_create_read_update_delete(client):
 
 def test_duplicate_name_returns_409(client, monkeypatch):
     create(client)
+
     # The database constraint must still become a 409 if a concurrent request
     # slips past the advisory name check.
     async def stale_name_check(*args, **kwargs):
@@ -96,14 +97,16 @@ def test_validation_errors_return_422(client):
         {
             **VALID_PAYLOAD,
             "datasets": [
-                {"video_directory": "/v", "frame_extraction": "sideways", "cache_directory": "/c"}
+                {
+                    "video_directory": "/v",
+                    "frame_extraction": "sideways",
+                    "cache_directory": "/c",
+                }
             ],
         },  # bad frame_extraction
         {
             **VALID_PAYLOAD,
-            "datasets": [
-                {"video_directory": "/v", "cache_directory": "/c"}
-            ],
+            "datasets": [{"video_directory": "/v", "cache_directory": "/c"}],
         },  # target_frames required unless full
         {
             **VALID_PAYLOAD,
@@ -165,7 +168,13 @@ source_fps = 30
 """
     response = client.post(
         "/api/datasets/import",
-        files={"file": ("char videos.toml", io.BytesIO(toml_body.encode()), "application/toml")},
+        files={
+            "file": (
+                "char videos.toml",
+                io.BytesIO(toml_body.encode()),
+                "application/toml",
+            )
+        },
     )
     assert response.status_code == 201, response.text
     imported = response.json()
@@ -175,7 +184,13 @@ source_fps = 30
     # Same filename again: deduplicated with a numeric suffix.
     response = client.post(
         "/api/datasets/import",
-        files={"file": ("char videos.toml", io.BytesIO(toml_body.encode()), "application/toml")},
+        files={
+            "file": (
+                "char videos.toml",
+                io.BytesIO(toml_body.encode()),
+                "application/toml",
+            )
+        },
     )
     assert response.json()["name"] == "char videos-2"
 

@@ -52,7 +52,9 @@ def validate_values(profile: TrainingProfile, values: dict) -> None:
     missing = [
         field.key
         for field in profile.model_fields
-        if field.required and _matches(values, field.when) and not _text(values, field.key)
+        if field.required
+        and _matches(values, field.when)
+        and not _text(values, field.key)
     ]
     for key in ("outputName", "outputDir", "musubiPath"):
         if not _text(values, key):
@@ -67,11 +69,15 @@ def validate_values(profile: TrainingProfile, values: dict) -> None:
     for selector in profile.selectors:
         selected = _text(values, selector.key)
         if selected not in selector.options:
-            raise ValuesError(f"{selector.key} must be one of: {', '.join(selector.options)}")
+            raise ValuesError(
+                f"{selector.key} must be one of: {', '.join(selector.options)}"
+            )
 
     attention = _text(values, "attention")
     if attention and attention not in profile.attention_options:
-        raise ValuesError(f"attention must be one of: {', '.join(profile.attention_options)}")
+        raise ValuesError(
+            f"attention must be one of: {', '.join(profile.attention_options)}"
+        )
 
     parse_extra_args(values)
 
@@ -223,7 +229,9 @@ def build_stage_argv(
     latents, text_encoder = profile.cache_commands
     return {
         "cache_latents": _cache_argv(latents, values, musubi_path, dataset_config_path),
-        "cache_text_encoder": _cache_argv(text_encoder, values, musubi_path, dataset_config_path),
+        "cache_text_encoder": _cache_argv(
+            text_encoder, values, musubi_path, dataset_config_path
+        ),
         "train": _train_argv(profile, values, musubi_path, dataset_config_path),
     }
 

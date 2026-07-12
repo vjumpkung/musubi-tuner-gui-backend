@@ -21,7 +21,9 @@ MAX_LOG_BYTES = 50 * 1024 * 1024
 PROGRESS_UPDATE_INTERVAL = 1.0
 
 LINE_SPLIT = re.compile(rb"\r\n|\r|\n")
-STEP_PATTERN = re.compile(r"(\d+)/(\d+)\s*\[")  # tqdm: "steps: 35%|... | 350/1000 [00:10<...]"
+STEP_PATTERN = re.compile(
+    r"(\d+)/(\d+)\s*\["
+)  # tqdm: "steps: 35%|... | 350/1000 [00:10<...]"
 FALLBACK_STEP_PATTERN = re.compile(r"steps?[:\s].*?(\d+)/(\d+)", re.IGNORECASE)
 EPOCH_PATTERN = re.compile(r"epoch[:\s]+(\d+)(?:\s*/\s*(\d+))?", re.IGNORECASE)
 
@@ -130,7 +132,9 @@ class QueueRunner:
         job_id = row["id"]
         profile = TRAINING_PROFILES.get(row["profile_id"])
         if profile is None:
-            await self._fail_job(job_id, f"Unknown training profile: {row['profile_id']}")
+            await self._fail_job(
+                job_id, f"Unknown training profile: {row['profile_id']}"
+            )
             return
 
         values = json.loads(row["values_json"])
@@ -147,16 +151,24 @@ class QueueRunner:
             snapshot_path.write_text(row["dataset_config_toml"], encoding="utf-8")
 
         try:
-            musubi_path = self.settings.resolve_inside_workspace(str(values.get("musubiPath", "")))
-            argv_by_stage = build_stage_argv(profile, values, musubi_path, snapshot_path)
+            musubi_path = self.settings.resolve_inside_workspace(
+                str(values.get("musubiPath", ""))
+            )
+            argv_by_stage = build_stage_argv(
+                profile, values, musubi_path, snapshot_path
+            )
         except ValueError as error:
             await self._fail_job(job_id, str(error), stages)
             return
         if not musubi_path.is_dir():
-            await self._fail_job(job_id, f"musubi-tuner directory not found: {musubi_path}", stages)
+            await self._fail_job(
+                job_id, f"musubi-tuner directory not found: {musubi_path}", stages
+            )
             return
         if shutil.which("accelerate") is None:
-            await self._fail_job(job_id, "accelerate is not available on the server", stages)
+            await self._fail_job(
+                job_id, "accelerate is not available on the server", stages
+            )
             return
 
         progress = {"epoch": None, "step": None, "total_steps": None, "percent": None}
@@ -170,7 +182,9 @@ class QueueRunner:
                 if stage["status"] != "pending":
                     continue
                 stage["status"] = "running"
-                if not await self._update_stages(job_id, stages, current_stage=stage["key"]):
+                if not await self._update_stages(
+                    job_id, stages, current_stage=stage["key"]
+                ):
                     self._clear_current(job_id)
                     return
                 argv = argv_by_stage[stage["key"]]
@@ -178,11 +192,15 @@ class QueueRunner:
                 self._log(log_file, f"=== stage {stage['key']}: {command_text}")
 
                 try:
-                    self.current_process = await spawn(argv, cwd=self.settings.workspace_root)
+                    self.current_process = await spawn(
+                        argv, cwd=self.settings.workspace_root
+                    )
                 except OSError as error:
                     stage["status"] = "failed"
                     self._skip_remaining(stages, index + 1)
-                    await self._fail_job(job_id, f"Could not start {stage['key']}: {error}", stages)
+                    await self._fail_job(
+                        job_id, f"Could not start {stage['key']}: {error}", stages
+                    )
                     return
 
                 if self.cancel_requested:
@@ -215,11 +233,16 @@ class QueueRunner:
                 if return_code != 0:
                     stage["status"] = "failed"
                     self._skip_remaining(stages, index + 1)
-                    error_text = "\n".join(last_lines) or f"{stage['key']} exited with code {return_code}"
+                    error_text = (
+                        "\n".join(last_lines)
+                        or f"{stage['key']} exited with code {return_code}"
+                    )
                     await self._fail_job(job_id, error_text, stages, progress)
                     return
                 stage["status"] = "completed"
-                if not await self._update_stages(job_id, stages, current_stage=stage["key"]):
+                if not await self._update_stages(
+                    job_id, stages, current_stage=stage["key"]
+                ):
                     self._clear_current(job_id)
                     return
 
@@ -277,7 +300,9 @@ class QueueRunner:
             if stage["status"] == "pending":
                 stage["status"] = "skipped"
 
-    async def _update_stages(self, job_id: str, stages: list[dict], current_stage: str) -> bool:
+    async def _update_stages(
+        self, job_id: str, stages: list[dict], current_stage: str
+    ) -> bool:
         cursor = await self.db.connection.execute(
             "UPDATE training_jobs SET stages_json = ?, current_stage = ? "
             "WHERE id = ? AND status = 'running'",
@@ -337,7 +362,9 @@ async def recover_interrupted_jobs(db: Database) -> None:
     """Jobs still marked running were interrupted by a server restart."""
     now = utc_now()
     async with db.write_lock:
-        rows = await db.fetch_all("SELECT id, stages_json FROM training_jobs WHERE status = 'running'")
+        rows = await db.fetch_all(
+            "SELECT id, stages_json FROM training_jobs WHERE status = 'running'"
+        )
         for row in rows:
             stages = json.loads(row["stages_json"])
             for stage in stages:

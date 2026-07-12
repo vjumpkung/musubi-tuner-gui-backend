@@ -15,7 +15,9 @@ from pathlib import Path
 TERMINATE_GRACE_SECONDS = 10.0
 
 
-async def spawn(argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> asyncio.subprocess.Process:
+async def spawn(
+    argv: list[str], cwd: Path, env: dict[str, str] | None = None
+) -> asyncio.subprocess.Process:
     """Spawn argv in its own process group with combined stdout/stderr."""
     kwargs: dict = {}
     if os.name == "nt":
@@ -40,7 +42,11 @@ async def terminate_tree(process: asyncio.subprocess.Process) -> None:
     if os.name == "nt":
         # No process-group SIGTERM on Windows; kill the tree forcefully.
         killer = await asyncio.create_subprocess_exec(
-            "taskkill", "/PID", str(process.pid), "/T", "/F",
+            "taskkill",
+            "/PID",
+            str(process.pid),
+            "/T",
+            "/F",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )

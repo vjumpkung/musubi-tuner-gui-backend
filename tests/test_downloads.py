@@ -44,12 +44,16 @@ def install_script(paths, filename, body):
 
 
 def test_unknown_script_id_returns_404(client):
-    response = client.post("/api/downloads", json={"script_id": "nope", "destination": "."})
+    response = client.post(
+        "/api/downloads", json={"script_id": "nope", "destination": "."}
+    )
     assert response.status_code == 404
 
 
 def test_missing_script_file_returns_503(client):
-    response = client.post("/api/downloads", json={"script_id": "flux2-dev", "destination": "."})
+    response = client.post(
+        "/api/downloads", json={"script_id": "flux2-dev", "destination": "."}
+    )
     assert response.status_code == 503
 
 
@@ -63,7 +67,9 @@ def test_missing_hf_cli_returns_503(client, paths, monkeypatch):
             None if name == "hf" else real_which(name, *args, **kwargs)
         ),
     )
-    response = client.post("/api/downloads", json={"script_id": "flux2-dev", "destination": "."})
+    response = client.post(
+        "/api/downloads", json={"script_id": "flux2-dev", "destination": "."}
+    )
     assert response.status_code == 503
     assert "hf CLI" in response.json()["detail"]
 
@@ -78,7 +84,9 @@ def test_destination_outside_root_returns_400(client, paths):
 
 def test_download_completes_with_progress(client, paths):
     install_script(paths, "download_flux2_dev.sh", FAST_SCRIPT)
-    response = client.post("/api/downloads", json={"script_id": "flux2-dev", "destination": "."})
+    response = client.post(
+        "/api/downloads", json={"script_id": "flux2-dev", "destination": "."}
+    )
     assert response.status_code == 202
     job = response.json()
     assert job["script_id"] == "flux2-dev"
@@ -86,7 +94,8 @@ def test_download_completes_with_progress(client, paths):
 
     done = wait_for(
         lambda: (
-            (data := client.get(f"/api/downloads/{job['id']}").json())["status"] == "completed"
+            (data := client.get(f"/api/downloads/{job['id']}").json())["status"]
+            == "completed"
             and data
         )
     )
@@ -96,10 +105,13 @@ def test_download_completes_with_progress(client, paths):
 
 def test_failed_download_reports_error(client, paths):
     install_script(paths, "download_flux2_dev.sh", FAILING_SCRIPT)
-    job = client.post("/api/downloads", json={"script_id": "flux2-dev", "destination": "."}).json()
+    job = client.post(
+        "/api/downloads", json={"script_id": "flux2-dev", "destination": "."}
+    ).json()
     failed = wait_for(
         lambda: (
-            (data := client.get(f"/api/downloads/{job['id']}").json())["status"] == "failed"
+            (data := client.get(f"/api/downloads/{job['id']}").json())["status"]
+            == "failed"
             and data
         )
     )
@@ -111,12 +123,18 @@ def test_failed_download_reports_error(client, paths):
 
 def test_duplicate_active_job_conflicts_and_cancel_is_idempotent(client, paths):
     install_script(paths, "download_framepack.sh", SLOW_SCRIPT)
-    first = client.post("/api/downloads", json={"script_id": "framepack", "destination": "."})
+    first = client.post(
+        "/api/downloads", json={"script_id": "framepack", "destination": "."}
+    )
     assert first.status_code == 202
     job = first.json()
-    wait_for(lambda: client.get(f"/api/downloads/{job['id']}").json()["status"] == "running")
+    wait_for(
+        lambda: client.get(f"/api/downloads/{job['id']}").json()["status"] == "running"
+    )
 
-    duplicate = client.post("/api/downloads", json={"script_id": "framepack", "destination": "."})
+    duplicate = client.post(
+        "/api/downloads", json={"script_id": "framepack", "destination": "."}
+    )
     assert duplicate.status_code == 409
 
     cancelled = client.post(f"/api/downloads/{job['id']}/cancel")
@@ -128,7 +146,9 @@ def test_duplicate_active_job_conflicts_and_cancel_is_idempotent(client, paths):
     assert again.json()["status"] == "cancelled"
 
     # The slot is free once the job is no longer active.
-    retry = client.post("/api/downloads", json={"script_id": "framepack", "destination": "."})
+    retry = client.post(
+        "/api/downloads", json={"script_id": "framepack", "destination": "."}
+    )
     assert retry.status_code == 202
     client.post(f"/api/downloads/{retry.json()['id']}/cancel")
 

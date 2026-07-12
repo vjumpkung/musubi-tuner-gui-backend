@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import re
 
-SOURCE_KEYS = ("image_directory", "image_jsonl_file", "video_directory", "video_jsonl_file")
+SOURCE_KEYS = (
+    "image_directory",
+    "image_jsonl_file",
+    "video_directory",
+    "video_jsonl_file",
+)
 DIRECTORY_SOURCE_KEYS = {"image_directory", "video_directory"}
 JSONL_SOURCE_KEYS = {"image_jsonl_file", "video_jsonl_file"}
 VIDEO_SOURCE_KEYS = {"video_directory", "video_jsonl_file"}
@@ -91,7 +96,9 @@ def validate_config(general: object, datasets: object) -> tuple[list[str], list[
             warnings.append(f"general: unknown key '{key}' was preserved")
 
     if "resolution" in general and not _is_valid_resolution(general["resolution"]):
-        errors.append("general: resolution must be a number or an array of one or two integers")
+        errors.append(
+            "general: resolution must be a number or an array of one or two integers"
+        )
 
     cache_directories: dict[str, int] = {}
 
@@ -127,17 +134,27 @@ def validate_config(general: object, datasets: object) -> tuple[list[str], list[
         if "resolution" not in general and "resolution" not in dataset:
             errors.append(f"{label}: resolution must be set here or in [general]")
         if "resolution" in dataset and not _is_valid_resolution(dataset["resolution"]):
-            errors.append(f"{label}: resolution must be a number or an array of one or two integers")
+            errors.append(
+                f"{label}: resolution must be a number or an array of one or two integers"
+            )
 
         if source_key in DIRECTORY_SOURCE_KEYS:
-            caption_extension = dataset.get("caption_extension", general.get("caption_extension"))
+            caption_extension = dataset.get(
+                "caption_extension", general.get("caption_extension")
+            )
             if not _is_non_empty_string(caption_extension):
-                errors.append(f"{label}: caption_extension must be set here or in [general]")
+                errors.append(
+                    f"{label}: caption_extension must be set here or in [general]"
+                )
             if not _is_non_empty_string(dataset.get("cache_directory")):
-                warnings.append(f"{label}: cache_directory is recommended for directory datasets")
+                warnings.append(
+                    f"{label}: cache_directory is recommended for directory datasets"
+                )
         else:
             if not _is_non_empty_string(dataset.get("cache_directory")):
-                errors.append(f"{label}: cache_directory is required for JSONL datasets")
+                errors.append(
+                    f"{label}: cache_directory is required for JSONL datasets"
+                )
 
         cache_directory = dataset.get("cache_directory")
         if _is_non_empty_string(cache_directory):
@@ -171,13 +188,17 @@ def _validate_video_dataset(
 
     target_frames = dataset.get("target_frames")
     if frame_extraction != "full" and target_frames is None:
-        errors.append(f"{label}: target_frames is required unless frame_extraction is 'full'")
+        errors.append(
+            f"{label}: target_frames is required unless frame_extraction is 'full'"
+        )
     if target_frames is not None:
         if not isinstance(target_frames, list) or not all(
             isinstance(item, int) and not isinstance(item, bool) and item >= 1
             for item in target_frames
         ):
-            errors.append(f"{label}: target_frames must be an array of positive integers")
+            errors.append(
+                f"{label}: target_frames must be an array of positive integers"
+            )
         else:
             if frame_extraction == "chunk" and 1 in target_frames:
                 warnings.append(
@@ -192,11 +213,17 @@ def _validate_video_dataset(
                     )
 
     if "max_frames" in dataset and frame_extraction != "full":
-        warnings.append(f"{label}: max_frames only applies when frame_extraction is 'full'")
+        warnings.append(
+            f"{label}: max_frames only applies when frame_extraction is 'full'"
+        )
     if "frame_stride" in dataset and frame_extraction != "slide":
-        warnings.append(f"{label}: frame_stride only applies when frame_extraction is 'slide'")
+        warnings.append(
+            f"{label}: frame_stride only applies when frame_extraction is 'slide'"
+        )
     if "frame_sample" in dataset and frame_extraction != "uniform":
-        warnings.append(f"{label}: frame_sample only applies when frame_extraction is 'uniform'")
+        warnings.append(
+            f"{label}: frame_sample only applies when frame_extraction is 'uniform'"
+        )
 
 
 def normalize_config(general: dict, datasets: list, extras: dict | None = None) -> dict:
@@ -207,7 +234,11 @@ def normalize_config(general: dict, datasets: list, extras: dict | None = None) 
         if "source_fps" in dataset and _is_number(dataset["source_fps"]):
             dataset["source_fps"] = float(dataset["source_fps"])
         normalized_datasets.append(dataset)
-    return {**(extras or {}), "general": dict(general or {}), "datasets": normalized_datasets}
+    return {
+        **(extras or {}),
+        "general": dict(general or {}),
+        "datasets": normalized_datasets,
+    }
 
 
 def slugify(name: str) -> str:

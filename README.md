@@ -4,7 +4,8 @@ FastAPI backend for the musubi-tuner GUI. Implements the contract in
 `musubi-tuner-gui-frontend/docs/download-api.md`:
 
 - **Downloads** — runs allowlisted model download scripts as async jobs.
-- **Dataset manager** — stores musubi-tuner dataset configs with TOML import/export.
+- **Dataset manager** — stores musubi-tuner dataset configs, managed captioned media, control
+  images, and TOML import/export.
 - **Training job queue** — executes training jobs one at a time through a FIFO queue.
 
 ## Setup
@@ -40,6 +41,22 @@ inside the app, and multiple workers would double-execute jobs.
 | `MUSUBI_GUI_WORKSPACE_ROOT` | current directory        | Root confining download destinations, `musubiPath`, and output/logging dirs |
 | `MUSUBI_GUI_WEB_DIR`        | `./web`                  | Built Vite frontend served in production            |
 | `MUSUBI_GUI_CORS_ORIGINS`   | Vite dev origins on 5173 | Comma-separated allowed CORS origins                |
+| `MUSUBI_GUI_MANAGED_MAX_FILES` | `1000`                 | Maximum files in one managed dataset upload         |
+| `MUSUBI_GUI_MANAGED_MAX_FILE_BYTES` | `107374182400` (100 GiB) | Maximum bytes for one uploaded media or control file |
+| `MUSUBI_GUI_MANAGED_MAX_TOTAL_BYTES` | `1099511627776` (1 TiB) | Maximum combined media bytes in one upload    |
+| `MUSUBI_GUI_MANAGED_MAX_REQUEST_BYTES` | `1181116006400` (1.07 TiB) | Maximum full multipart request-body bytes before parsing |
+| `MUSUBI_GUI_MANAGED_MAX_STORAGE_BYTES` | `10995116277760` (10 TiB) | Maximum aggregate bytes under managed dataset storage |
+
+Managed upload admission is serialized in the required single-worker server so concurrent
+requests cannot overcommit the aggregate storage quota. Failed creations and deletions use
+identifiable `.orphan-*`, `.pending-delete-*`, and `.tombstone-*` directories. Reconciliation
+checks SQLite ownership before restoring or removing them at startup and before the next managed
+storage operation; all retained state remains included in quota accounting.
+
+Managed uploads accept captions entered in the UI or UTF-8 `.txt` sidecars with the same stem as
+their media (`a.png` + `a.txt`). Image datasets may include a separate control-image upload whose
+files use the target stem (`a.jpg` + control `a.png`) or numbered stems such as `a_0.png` and
+`a_0001.png`; the generated TOML includes `control_directory`.
 
 The download scripts are not part of this repository — place the `download_*.sh` files
 listed in the API contract into `scripts/`. Server tools required at runtime: `bash` and

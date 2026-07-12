@@ -1,13 +1,17 @@
+import asyncio
+import io
 import json
 import shutil
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from .conftest import wait_for
 
-STUB_SCRIPT = '''
+STUB_SCRIPT = """
 import sys
 import time
 
@@ -28,7 +32,7 @@ if stage == "train":
     print("epoch 2/2", flush=True)
     print("steps: 100%|##########| 10/10 [00:02<00:00,  5.00it/s]", flush=True)
 print(f"{stage} done", flush=True)
-'''
+"""
 
 JOB_VALUES = {
     "musubiPath": "./musubi-tuner",
@@ -44,7 +48,9 @@ JOB_VALUES = {
 DATASET_PAYLOAD = {
     "name": "queue-dataset",
     "general": {"resolution": [512, 512], "caption_extension": ".txt"},
-    "datasets": [{"image_directory": "/data/images", "cache_directory": "/cache/images"}],
+    "datasets": [
+        {"image_directory": "/data/images", "cache_directory": "/cache/images"}
+    ],
 }
 
 
@@ -98,7 +104,9 @@ def make_dataset(client):
     return response.json()["id"]
 
 
-def make_job(client, dataset_id, name="job", stub_mode="ok", skip_cache=False, values=None):
+def make_job(
+    client, dataset_id, name="job", stub_mode="ok", skip_cache=False, values=None
+):
     response = client.post(
         "/api/training/jobs",
         json={
@@ -117,18 +125,79 @@ def get_job(client, job_id):
     return client.get(f"/api/training/jobs/{job_id}").json()
 
 
+def test_job_creation_rechecks_dataset_after_concurrent_managed_delete(
+    training_client, paths, monkeypatch
+):
+    managed_response = training_client.post(
+        "/api/datasets/managed",
+        data={
+            "name": "racing managed dataset",
+            "media_type": "image",
+            "resolution": json.dumps([512, 512]),
+            "captions": json.dumps(["caption"]),
+        },
+        files={"files": ("sample.png", io.BytesIO(b"image"), "image/png")},
+    )
+    assert managed_response.status_code == 201
+    dataset_id = managed_response.json()["id"]
+
+    from app import training
+
+    real_insert_job = training._insert_job
+    reached_insert = threading.Event()
+    allow_insert = threading.Event()
+
+    async def delayed_insert_job(*args, **kwargs):
+        reached_insert.set()
+        await asyncio.to_thread(allow_insert.wait)
+        return await real_insert_job(*args, **kwargs)
+
+    monkeypatch.setattr(training, "_insert_job", delayed_insert_job)
+    request_body = {
+        "name": "racing job",
+        "profile_id": "wan-22",
+        "dataset_config_id": dataset_id,
+        "values": JOB_VALUES,
+    }
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            training_client.post, "/api/training/jobs", json=request_body
+        )
+        assert reached_insert.wait(timeout=5)
+        deleted = training_client.delete(f"/api/datasets/{dataset_id}")
+        allow_insert.set()
+        created = future.result(timeout=10)
+
+    assert deleted.status_code == 204
+    assert created.status_code == 404
+    assert created.json()["detail"] == "Unknown dataset config"
+    assert training_client.get("/api/training/jobs").json() == []
+    assert list(paths["data"].joinpath("jobs").iterdir()) == []
+
+
 def test_create_validations(training_client):
     dataset_id = make_dataset(training_client)
 
     unknown_profile = training_client.post(
         "/api/training/jobs",
-        json={"name": "x", "profile_id": "nope", "dataset_config_id": dataset_id, "values": {}},
+        json={
+            "name": "x",
+            "profile_id": "nope",
+            "dataset_config_id": dataset_id,
+            "values": {},
+        },
     )
     assert unknown_profile.status_code == 404
 
     unknown_dataset = training_client.post(
         "/api/training/jobs",
-        json={"name": "x", "profile_id": "wan-22", "dataset_config_id": "missing", "values": JOB_VALUES},
+        json={
+            "name": "x",
+            "profile_id": "wan-22",
+            "dataset_config_id": "missing",
+            "values": JOB_VALUES,
+        },
     )
     assert unknown_dataset.status_code == 404
 
@@ -185,7 +254,11 @@ def test_jobs_queue_until_started_then_run_fifo(training_client):
     assert first["status"] == "queued"
     assert first["queue_position"] == 0
     assert second["queue_position"] == 1
-    assert [stage["status"] for stage in first["stages"]] == ["pending", "pending", "pending"]
+    assert [stage["status"] for stage in first["stages"]] == [
+        "pending",
+        "pending",
+        "pending",
+    ]
 
     queue = training_client.get("/api/training/queue").json()
     assert queue == {"state": "paused", "queued": 2, "running_job_id": None}
@@ -199,10 +272,16 @@ def test_jobs_queue_until_started_then_run_fifo(training_client):
     assert started.json()["state"] == "running"
 
     done_first = wait_for(
-        lambda: (job := get_job(training_client, first["id"]))["status"] == "completed" and job
+        lambda: (
+            (job := get_job(training_client, first["id"]))["status"] == "completed"
+            and job
+        )
     )
     done_second = wait_for(
-        lambda: (job := get_job(training_client, second["id"]))["status"] == "completed" and job
+        lambda: (
+            (job := get_job(training_client, second["id"]))["status"] == "completed"
+            and job
+        )
     )
     assert done_first["finished_at"] <= done_second["started_at"]
     assert [stage["status"] for stage in done_first["stages"]] == [
@@ -214,7 +293,9 @@ def test_jobs_queue_until_started_then_run_fifo(training_client):
     assert done_first["progress"]["epoch"] == 2
     assert done_first["progress"]["step"] == 10
 
-    logs = training_client.get(f"/api/training/jobs/{first['id']}/logs", params={"offset": 0})
+    logs = training_client.get(
+        f"/api/training/jobs/{first['id']}/logs", params={"offset": 0}
+    )
     body = logs.json()
     assert "train done" in body["content"]
     assert body["eof"] is True
@@ -227,13 +308,24 @@ def test_jobs_queue_until_started_then_run_fifo(training_client):
 def test_skip_cache_stages(training_client):
     dataset_id = make_dataset(training_client)
     job = make_job(training_client, dataset_id, skip_cache=True)
-    assert [stage["status"] for stage in job["stages"]] == ["skipped", "skipped", "pending"]
+    assert [stage["status"] for stage in job["stages"]] == [
+        "skipped",
+        "skipped",
+        "pending",
+    ]
 
     training_client.post("/api/training/queue/start")
     done = wait_for(
-        lambda: (data := get_job(training_client, job["id"]))["status"] == "completed" and data
+        lambda: (
+            (data := get_job(training_client, job["id"]))["status"] == "completed"
+            and data
+        )
     )
-    assert [stage["status"] for stage in done["stages"]] == ["skipped", "skipped", "completed"]
+    assert [stage["status"] for stage in done["stages"]] == [
+        "skipped",
+        "skipped",
+        "completed",
+    ]
 
 
 def test_failed_stage_marks_job_failed_and_retry_clones(training_client, paths):
@@ -242,9 +334,15 @@ def test_failed_stage_marks_job_failed_and_retry_clones(training_client, paths):
     training_client.post("/api/training/queue/start")
 
     failed = wait_for(
-        lambda: (data := get_job(training_client, job["id"]))["status"] == "failed" and data
+        lambda: (
+            (data := get_job(training_client, job["id"]))["status"] == "failed" and data
+        )
     )
-    assert [stage["status"] for stage in failed["stages"]] == ["failed", "skipped", "skipped"]
+    assert [stage["status"] for stage in failed["stages"]] == [
+        "failed",
+        "skipped",
+        "skipped",
+    ]
     assert "boom failure" in failed["error"]
 
     retried = training_client.post(f"/api/training/jobs/{job['id']}/retry")
@@ -267,8 +365,10 @@ def test_cancel_running_job(training_client):
     training_client.post("/api/training/queue/start")
 
     wait_for(
-        lambda: (data := get_job(training_client, slow["id"]))["status"] == "running"
-        and data["current_stage"] == "train"
+        lambda: (
+            (data := get_job(training_client, slow["id"]))["status"] == "running"
+            and data["current_stage"] == "train"
+        )
     )
     cancelled = training_client.post(f"/api/training/jobs/{slow['id']}/cancel")
     assert cancelled.status_code == 200
@@ -277,7 +377,10 @@ def test_cancel_running_job(training_client):
     assert stages["train"] == "cancelled"
 
     # Idempotent for an already-cancelled job.
-    assert training_client.post(f"/api/training/jobs/{slow['id']}/cancel").status_code == 200
+    assert (
+        training_client.post(f"/api/training/jobs/{slow['id']}/cancel").status_code
+        == 200
+    )
 
     # The runner moves on to the next job afterwards.
     follow_up = make_job(training_client, dataset_id, name="after-cancel")
@@ -294,30 +397,46 @@ def test_cancel_queued_job_and_completed_conflict(training_client):
     done = make_job(training_client, dataset_id, name="to-complete")
     training_client.post("/api/training/queue/start")
     wait_for(lambda: get_job(training_client, done["id"])["status"] == "completed")
-    assert training_client.post(f"/api/training/jobs/{done['id']}/cancel").status_code == 409
-    assert training_client.post(f"/api/training/jobs/{done['id']}/retry").status_code == 409
+    assert (
+        training_client.post(f"/api/training/jobs/{done['id']}/cancel").status_code
+        == 409
+    )
+    assert (
+        training_client.post(f"/api/training/jobs/{done['id']}/retry").status_code
+        == 409
+    )
 
 
 def test_reorder_and_delete_rules(training_client):
     dataset_id = make_dataset(training_client)
-    jobs = [make_job(training_client, dataset_id, name=f"job-{index}") for index in range(3)]
+    jobs = [
+        make_job(training_client, dataset_id, name=f"job-{index}") for index in range(3)
+    ]
 
     reordered = training_client.patch(
         f"/api/training/jobs/{jobs[2]['id']}", json={"queue_position": 0}
     )
     assert reordered.status_code == 200
     assert reordered.json()["queue_position"] == 0
-    listed = training_client.get("/api/training/jobs", params={"status": "queued"}).json()
+    listed = training_client.get(
+        "/api/training/jobs", params={"status": "queued"}
+    ).json()
     positions = {job["name"]: job["queue_position"] for job in listed}
     assert positions == {"job-2": 0, "job-0": 1, "job-1": 2}
 
     # Queued jobs cannot be deleted.
-    assert training_client.delete(f"/api/training/jobs/{jobs[0]['id']}").status_code == 409
+    assert (
+        training_client.delete(f"/api/training/jobs/{jobs[0]['id']}").status_code == 409
+    )
 
-    cancelled = training_client.post(f"/api/training/jobs/{jobs[1]['id']}/cancel").json()
+    cancelled = training_client.post(
+        f"/api/training/jobs/{jobs[1]['id']}/cancel"
+    ).json()
     assert cancelled["status"] == "cancelled"
     # Cancelling renumbers the remaining queue.
-    listed = training_client.get("/api/training/jobs", params={"status": "queued"}).json()
+    listed = training_client.get(
+        "/api/training/jobs", params={"status": "queued"}
+    ).json()
     positions = {job["name"]: job["queue_position"] for job in listed}
     assert positions == {"job-2": 0, "job-0": 1}
     # Terminal jobs cannot be reordered.
@@ -331,7 +450,9 @@ def test_reorder_and_delete_rules(training_client):
 
 def test_huggingface_token_never_echoed(training_client):
     dataset_id = make_dataset(training_client)
-    job = make_job(training_client, dataset_id, values={"huggingfaceToken": "hf_supersecret"})
+    job = make_job(
+        training_client, dataset_id, values={"huggingfaceToken": "hf_supersecret"}
+    )
     assert "hf_supersecret" not in json.dumps(job)
     fetched = training_client.get(f"/api/training/jobs/{job['id']}")
     assert "hf_supersecret" not in fetched.text
@@ -349,7 +470,9 @@ def test_huggingface_token_is_redacted_from_logs_and_errors(training_client):
     )
     training_client.post("/api/training/queue/start")
     failed = wait_for(
-        lambda: (data := get_job(training_client, job["id"]))["status"] == "failed" and data
+        lambda: (
+            (data := get_job(training_client, job["id"]))["status"] == "failed" and data
+        )
     )
     logs = training_client.get(f"/api/training/jobs/{job['id']}/logs").json()["content"]
     assert "hf_supersecret" not in failed["error"]

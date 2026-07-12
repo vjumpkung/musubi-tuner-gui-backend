@@ -61,7 +61,11 @@ class DownloadJob:
     last_lines: deque[str] = field(default_factory=lambda: deque(maxlen=20))
 
     def to_response(self) -> dict:
-        payload: dict = {"id": self.id, "script_id": self.script_id, "status": self.status}
+        payload: dict = {
+            "id": self.id,
+            "script_id": self.script_id,
+            "status": self.status,
+        }
         if self.progress is not None:
             payload["progress"] = round(min(100.0, max(0.0, self.progress)), 1)
         if self.current_file:
@@ -90,19 +94,28 @@ class DownloadManager:
             raise HTTPException(status_code=404, detail="Unknown download script")
         script_path = self.settings.scripts_dir / filename
         if not script_path.is_file():
-            raise HTTPException(status_code=503, detail=f"Download script is not installed: {filename}")
+            raise HTTPException(
+                status_code=503, detail=f"Download script is not installed: {filename}"
+            )
         # Resolve bash through PATH ourselves: on Windows CreateProcess would search
         # system32 first and hit the WSL stub instead of Git Bash.
         bash = shutil.which("bash")
         if bash is None:
-            raise HTTPException(status_code=503, detail="bash is not available on the server")
+            raise HTTPException(
+                status_code=503, detail="bash is not available on the server"
+            )
         if shutil.which("hf") is None:
-            raise HTTPException(status_code=503, detail="Hugging Face hf CLI is not available on the server")
+            raise HTTPException(
+                status_code=503,
+                detail="Hugging Face hf CLI is not available on the server",
+            )
 
         try:
             destination = self.settings.resolve_inside_workspace(destination_raw or ".")
         except ValueError:
-            raise HTTPException(status_code=400, detail="Destination is outside the allowed root")
+            raise HTTPException(
+                status_code=400, detail="Destination is outside the allowed root"
+            )
 
         for existing in self.jobs.values():
             if (
@@ -116,7 +129,9 @@ class DownloadManager:
                 )
 
         destination.mkdir(parents=True, exist_ok=True)
-        job = DownloadJob(id=str(uuid.uuid4()), script_id=script_id, destination=destination)
+        job = DownloadJob(
+            id=str(uuid.uuid4()), script_id=script_id, destination=destination
+        )
         self.jobs[job.id] = job
         job.task = asyncio.create_task(self._run(job, bash, script_path))
         return job
@@ -163,7 +178,9 @@ class DownloadManager:
         else:
             job.status = "failed"
             job.message = None
-            job.error = "\n".join(job.last_lines) or f"Script exited with code {return_code}"
+            job.error = (
+                "\n".join(job.last_lines) or f"Script exited with code {return_code}"
+            )
 
     def _apply_line(self, job: DownloadJob, line: str) -> None:
         """Best-effort progress from the script's echo/hf output."""
@@ -184,7 +201,9 @@ class DownloadManager:
         if job.status == "cancelled":
             return job
         if job.status in {"completed", "failed"}:
-            raise HTTPException(status_code=409, detail=f"A {job.status} job can no longer be cancelled")
+            raise HTTPException(
+                status_code=409, detail=f"A {job.status} job can no longer be cancelled"
+            )
         job.status = "cancelled"
         job.message = "Cancelled"
         if job.process is not None:

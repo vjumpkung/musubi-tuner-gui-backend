@@ -86,7 +86,9 @@ class Database:
         await self.connection.commit()
 
     async def get_setting(self, key: str, default: str) -> str:
-        row = await self.fetch_one("SELECT value FROM app_settings WHERE key = ?", (key,))
+        row = await self.fetch_one(
+            "SELECT value FROM app_settings WHERE key = ?", (key,)
+        )
         return row["value"] if row else default
 
     async def set_setting(self, key: str, value: str) -> None:

@@ -49,12 +49,17 @@ def test_wan22_stage_argv():
     latents = stages["cache_latents"]
     assert latents[0] == "python"
     assert latents[1].endswith("wan_cache_latents.py")
-    assert latents[2:4] == ["--dataset_config", str(Path("/data/jobs/j1/dataset_config.toml"))]
+    assert latents[2:4] == [
+        "--dataset_config",
+        str(Path("/data/jobs/j1/dataset_config.toml")),
+    ]
     assert "--vae" in latents
 
     text_encoder = stages["cache_text_encoder"]
     assert text_encoder[1].endswith("wan_cache_text_encoder_outputs.py")
-    assert text_encoder[text_encoder.index("--t5") + 1].endswith("umt5-xxl-enc-bf16.pth")
+    assert text_encoder[text_encoder.index("--t5") + 1].endswith(
+        "umt5-xxl-enc-bf16.pth"
+    )
     assert text_encoder[text_encoder.index("--batch_size") + 1] == "16"
 
     train = stages["train"]
@@ -62,7 +67,9 @@ def test_wan22_stage_argv():
     # wan-22 defaults to 16 CPU threads per process.
     assert train[train.index("--num_cpu_threads_per_process") + 1] == "16"
     assert train[train.index("--task") + 1] == "t2v-A14B"
-    assert train[train.index("--dit_high_noise") + 1].endswith("high_noise_14B_fp16.safetensors")
+    assert train[train.index("--dit_high_noise") + 1].endswith(
+        "high_noise_14B_fp16.safetensors"
+    )
     assert train[train.index("--network_module") + 1] == "networks.lora_wan"
     # The snapshot path is forced; the client cannot point the trainer elsewhere.
     assert train[train.index("--dataset_config") + 1] == str(
@@ -71,7 +78,10 @@ def test_wan22_stage_argv():
     assert "--gradient_checkpointing" in train
     assert "--fp8_base" not in train
     assert "--sdpa" in train
-    assert train[-2:] == ["--preserve_distribution_shape", "--log_with"] or "tensorboard" in train
+    assert (
+        train[-2:] == ["--preserve_distribution_shape", "--log_with"]
+        or "tensorboard" in train
+    )
 
 
 def test_conditional_fields_follow_task():
@@ -122,7 +132,9 @@ def test_validate_values_requires_profile_fields():
 
 
 def test_extra_args_tokens_are_validated():
-    assert parse_extra_args({"extraArgs": "--log_with tensorboard --flow_shift=3.0"}) == [
+    assert parse_extra_args(
+        {"extraArgs": "--log_with tensorboard --flow_shift=3.0"}
+    ) == [
         "--log_with",
         "tensorboard",
         "--flow_shift=3.0",
