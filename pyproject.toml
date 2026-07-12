@@ -1,0 +1,23 @@
+[project]
+name = "musubi-tuner-gui-backend"
+version = "0.1.0"
+description = "FastAPI backend for the musubi-tuner GUI: model downloads, dataset configs, and the training job queue."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "aiosqlite>=0.20",
+    "tomli-w>=1.0",
+    "python-multipart>=0.0.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
