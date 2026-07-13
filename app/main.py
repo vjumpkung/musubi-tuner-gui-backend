@@ -22,7 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import datasets, downloads, training
+from . import datasets, downloads, system_monitor, training
 from .config import load_settings
 from .db import Database
 from .downloads import DownloadManager
@@ -41,12 +41,17 @@ class ManagedUploadBodyLimitMiddleware:
         self.max_bytes = max_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if not (
-            scope["type"] == "http"
-            and scope.get("method") == "POST"
-            and str(scope.get("path", "")).rstrip("/")
-            in {"/api/datasets/managed", "/api/datasets/managed/batch"}
-        ):
+        method = scope.get("method")
+        path = str(scope.get("path", "")).rstrip("/")
+        is_managed_upload = (
+            method == "POST"
+            and path in {"/api/datasets/managed", "/api/datasets/managed/batch"}
+        ) or (
+            method == "PUT"
+            and path.startswith("/api/datasets/")
+            and path.endswith("/managed")
+        )
+        if scope["type"] != "http" or not is_managed_upload:
             await self.app(scope, receive, send)
             return
 
@@ -159,6 +164,7 @@ def create_app() -> FastAPI:
     app.include_router(downloads.router)
     app.include_router(datasets.router)
     app.include_router(training.router)
+    app.include_router(system_monitor.router)
 
     if (settings.web_dir / "index.html").is_file():
         app.mount(

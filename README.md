@@ -7,6 +7,7 @@ FastAPI backend for the musubi-tuner GUI. Implements the contract in
 - **Dataset manager** — stores musubi-tuner dataset configs, managed captioned media, control
   images, and TOML import/export.
 - **Training job queue** — executes training jobs one at a time through a FIFO queue.
+- **System monitor** — reports host CPU/RAM and NVIDIA GPU/VRAM utilization.
 
 ## Setup
 

@@ -67,6 +67,7 @@ def _job_response(row) -> dict:
         "stages": json.loads(row["stages_json"]),
         "progress": {
             "epoch": progress.get("epoch"),
+            "total_epochs": progress.get("total_epochs"),
             "step": progress.get("step"),
             "total_steps": progress.get("total_steps"),
             "percent": progress.get("percent"),
@@ -387,12 +388,9 @@ async def read_job(job_id: str, request: Request) -> dict:
 @router.get("/jobs/{job_id}/artifacts")
 async def list_job_artifacts(job_id: str, request: Request) -> dict:
     row = await _get_job(_db(request), job_id)
-    if row["status"] != "completed":
-        raise HTTPException(
-            status_code=409,
-            detail="LoRA artifacts are available after training completes",
-        )
-    artifacts = _artifact_paths(row, _settings(request))
+    artifacts = (
+        [] if row["status"] == "queued" else _artifact_paths(row, _settings(request))
+    )
     files = []
     for artifact in artifacts:
         try:
@@ -408,12 +406,9 @@ async def list_job_artifacts(job_id: str, request: Request) -> dict:
 @router.get("/jobs/{job_id}/artifacts/download")
 async def download_job_artifacts(job_id: str, request: Request) -> StreamingResponse:
     row = await _get_job(_db(request), job_id)
-    if row["status"] != "completed":
-        raise HTTPException(
-            status_code=409,
-            detail="LoRA artifacts are available after training completes",
-        )
-    artifacts = _artifact_paths(row, _settings(request))
+    artifacts = (
+        [] if row["status"] == "queued" else _artifact_paths(row, _settings(request))
+    )
     if not artifacts:
         raise HTTPException(
             status_code=404, detail="No LoRA artifacts found for this job"

@@ -495,10 +495,15 @@ def test_managed_request_content_length_is_rejected_before_parsing(
 
 
 @pytest.mark.parametrize(
-    "request_path", ["/api/datasets/managed", "/api/datasets/managed/batch"]
+    ("method", "request_path"),
+    [
+        ("POST", "/api/datasets/managed"),
+        ("POST", "/api/datasets/managed/batch"),
+        ("PUT", "/api/datasets/00000000-0000-0000-0000-000000000001/managed"),
+    ],
 )
 async def test_managed_request_chunked_body_is_counted_before_app_consumes_it(
-    request_path,
+    method, request_path
 ):
     from app.main import ManagedUploadBodyLimitMiddleware, _ManagedBodyTooLarge
 
@@ -527,7 +532,7 @@ async def test_managed_request_chunked_body_is_counted_before_app_consumes_it(
         {
             "type": "http",
             "http_version": "1.1",
-            "method": "POST",
+            "method": method,
             "scheme": "http",
             "path": request_path,
             "raw_path": request_path.encode(),
@@ -776,6 +781,208 @@ def test_update_managed_dataset_keeps_owned_toml_in_sync(client, paths):
         tomllib.loads((managed_dir / "dataset_config.toml").read_text(encoding="utf-8"))
         == saved
     )
+
+
+def test_edit_managed_dataset_adds_removes_and_updates_owned_files(client, paths):
+    created = _managed_batch_request(client).json()
+    config_id = created["id"]
+    managed_dir = paths["data"] / "managed_datasets" / config_id
+    assert client.get(f"/api/datasets/{config_id}").json()["managed"] is True
+
+    manifest_response = client.get(f"/api/datasets/{config_id}/managed-files")
+    assert manifest_response.status_code == 200
+    manifest = manifest_response.json()
+    image_manifest, video_manifest = manifest["datasets"]
+    assert image_manifest["files"][0]["caption"] == "still image"
+    assert image_manifest["control_files"][0]["name"] == "still.jpg"
+    assert video_manifest["files"][0]["name"] == "motion.mp4"
+
+    spec = {
+        "media_type": "image",
+        "resolution": [640, 640],
+        "num_repeats": 7,
+        "existing_files": [
+            {
+                "path": image_manifest["files"][0]["path"],
+                "caption": "edited still caption",
+            }
+        ],
+        "existing_control_files": [image_manifest["control_files"][0]["path"]],
+        "captions": ["new image caption"],
+        "file_count": 1,
+        "caption_file_count": 0,
+        "control_file_count": 1,
+    }
+    response = client.put(
+        f"/api/datasets/{config_id}/managed",
+        data={
+            "name": "edited multi dataset",
+            "description": "updated files",
+            "dataset_specs": json.dumps([spec]),
+        },
+        files=[
+            ("files", ("new.png", io.BytesIO(b"new image"), "image/png")),
+            (
+                "control_files",
+                ("new.jpg", io.BytesIO(b"new control"), "image/jpeg"),
+            ),
+        ],
+    )
+
+    assert response.status_code == 200, response.text
+    updated = response.json()
+    assert updated["name"] == "edited multi dataset"
+    assert updated["description"] == "updated files"
+    assert len(updated["datasets"]) == 1
+    assert updated["datasets"][0]["resolution"] == [640, 640]
+    assert updated["datasets"][0]["num_repeats"] == 7
+    assert (managed_dir / "dataset-1" / "media" / "still.png").read_bytes() == b"image"
+    assert (managed_dir / "dataset-1" / "media" / "still.txt").read_text(
+        encoding="utf-8"
+    ) == "edited still caption"
+    assert (
+        managed_dir / "dataset-1" / "media" / "new.png"
+    ).read_bytes() == b"new image"
+    assert (managed_dir / "dataset-1" / "media" / "new.txt").read_text(
+        encoding="utf-8"
+    ) == "new image caption"
+    assert (managed_dir / "dataset-1" / "control" / "still.jpg").is_file()
+    assert (managed_dir / "dataset-1" / "control" / "new.jpg").is_file()
+    assert not (managed_dir / "dataset-2").exists()
+
+    saved = tomllib.loads(
+        (managed_dir / "dataset_config.toml").read_text(encoding="utf-8")
+    )
+    assert saved["datasets"] == updated["datasets"]
+    edited_manifest = client.get(f"/api/datasets/{config_id}/managed-files").json()
+    assert [item["name"] for item in edited_manifest["datasets"][0]["files"]] == [
+        "new.png",
+        "still.png",
+    ]
+
+
+def test_edit_managed_dataset_supports_caption_and_repeat_only(client, paths):
+    created = _managed_request(client).json()
+    config_id = created["id"]
+    manifest = client.get(f"/api/datasets/{config_id}/managed-files").json()
+    media = manifest["datasets"][0]["files"][0]
+    spec = {
+        "media_type": "image",
+        "resolution": [512, 768],
+        "num_repeats": 4,
+        "existing_files": [{"path": media["path"], "caption": "new caption"}],
+        "existing_control_files": [],
+        "captions": [],
+        "file_count": 0,
+        "caption_file_count": 0,
+        "control_file_count": 0,
+    }
+
+    response = client.put(
+        f"/api/datasets/{config_id}/managed",
+        data={"name": created["name"], "dataset_specs": json.dumps([spec])},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["datasets"][0]["num_repeats"] == 4
+    caption = (
+        paths["data"]
+        / "managed_datasets"
+        / config_id
+        / "dataset-1"
+        / "media"
+        / "sample.txt"
+    )
+    assert caption.read_text(encoding="utf-8") == "new caption"
+
+
+def test_edit_managed_dataset_restores_files_when_swap_fails(
+    client, paths, monkeypatch
+):
+    from app import datasets
+
+    created = _managed_request(client).json()
+    config_id = created["id"]
+    managed_dir = paths["data"] / "managed_datasets" / config_id
+    manifest = client.get(f"/api/datasets/{config_id}/managed-files").json()
+    media = manifest["datasets"][0]["files"][0]
+    spec = {
+        "media_type": "image",
+        "resolution": [512, 768],
+        "num_repeats": 3,
+        "existing_files": [{"path": media["path"], "caption": "replacement"}],
+        "existing_control_files": [],
+        "captions": [],
+        "file_count": 0,
+        "caption_file_count": 0,
+        "control_file_count": 0,
+    }
+    real_rename = datasets._rename_managed_directory
+
+    def fail_new_directory_swap(source, destination):
+        if source.name.startswith(".edit-") and not source.name.startswith(
+            ".edit-backup-"
+        ):
+            raise OSError("simulated edit swap failure")
+        real_rename(source, destination)
+
+    monkeypatch.setattr(datasets, "_rename_managed_directory", fail_new_directory_swap)
+    response = client.put(
+        f"/api/datasets/{config_id}/managed",
+        data={"name": created["name"], "dataset_specs": json.dumps([spec])},
+    )
+
+    assert response.status_code == 500
+    assert (managed_dir / "media" / "sample.png").read_bytes() == b"image bytes"
+    assert (managed_dir / "media" / "sample.txt").read_text(
+        encoding="utf-8"
+    ) == "first caption"
+    assert (
+        client.get(f"/api/datasets/{config_id}").json()["datasets"]
+        == created["datasets"]
+    )
+    assert list((managed_dir.parent).glob(".edit-*")) == []
+
+
+def test_edit_managed_dataset_rejects_unknown_owned_path(client):
+    created = _managed_request(client).json()
+    spec = {
+        "media_type": "image",
+        "resolution": [512, 768],
+        "num_repeats": 1,
+        "existing_files": [{"path": "../outside.png", "caption": "caption"}],
+        "existing_control_files": [],
+        "captions": [],
+        "file_count": 0,
+        "caption_file_count": 0,
+        "control_file_count": 0,
+    }
+
+    response = client.put(
+        f"/api/datasets/{created['id']}/managed",
+        data={"name": created["name"], "dataset_specs": json.dumps([spec])},
+    )
+
+    assert response.status_code == 422
+    assert "unknown or duplicate path" in response.json()["detail"]
+
+
+def test_external_dataset_has_no_managed_file_editor(client, paths):
+    external_dir = paths["workspace"] / "external"
+    external_dir.mkdir()
+    created = client.post(
+        "/api/datasets",
+        json={
+            "name": "external files",
+            "general": {"resolution": [512, 512], "caption_extension": ".txt"},
+            "datasets": [{"image_directory": str(external_dir)}],
+        },
+    ).json()
+
+    detail = client.get(f"/api/datasets/{created['id']}").json()
+    assert detail["managed"] is False
+    response = client.get(f"/api/datasets/{created['id']}/managed-files")
+    assert response.status_code == 422
 
 
 def test_delete_managed_dataset_is_blocked_while_training_job_references_it(

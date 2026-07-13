@@ -67,6 +67,11 @@ def parse_progress(line: str, progress: dict) -> bool:
         if progress.get("epoch") != epoch:
             progress["epoch"] = epoch
             changed = True
+        if epoch_match.group(2):
+            total_epochs = int(epoch_match.group(2))
+            if progress.get("total_epochs") != total_epochs:
+                progress["total_epochs"] = total_epochs
+                changed = True
     return changed
 
 
@@ -171,7 +176,13 @@ class QueueRunner:
             )
             return
 
-        progress = {"epoch": None, "step": None, "total_steps": None, "percent": None}
+        progress = {
+            "epoch": None,
+            "total_epochs": None,
+            "step": None,
+            "total_steps": None,
+            "percent": None,
+        }
         last_lines: deque[str] = deque(maxlen=20)
 
         with log_path.open("ab") as log_file:

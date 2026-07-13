@@ -30,6 +30,7 @@ VIDEO_EXTENSIONS = {".mp4", ".webm", ".avi", ".mov", ".mkv"}
 CAPTION_EXTENSION = ".txt"
 MAX_CAPTION_FILE_BYTES = 1024 * 1024
 STALE_MANAGED_PREFIXES = (".orphan-", ".pending-delete-", ".tombstone-")
+EDIT_MANAGED_PREFIXES = (".edit-backup-", ".edit-")
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
 
@@ -69,9 +70,91 @@ def _stale_state(entry: Path) -> tuple[str, str] | None:
     return prefix, config_id
 
 
+def _edit_state(entry: Path) -> tuple[str, str] | None:
+    prefix = next(
+        (
+            candidate
+            for candidate in EDIT_MANAGED_PREFIXES
+            if entry.name.startswith(candidate)
+        ),
+        None,
+    )
+    if prefix is None:
+        return None
+    candidate = entry.name[len(prefix) : len(prefix) + 36]
+    try:
+        config_id = str(uuid.UUID(candidate))
+    except ValueError as error:
+        raise OSError(f"Unrecognized managed edit state: {entry.name}") from error
+    return prefix, config_id
+
+
+def _remove_managed_entry(entry: Path) -> None:
+    if entry.is_symlink() or entry.is_file():
+        entry.unlink()
+    else:
+        shutil.rmtree(entry)
+
+
+def _managed_directory_matches_config(directory: Path, config: dict) -> bool:
+    config_path = directory / "dataset_config.toml"
+    if not config_path.is_file():
+        return False
+    try:
+        return tomllib.loads(config_path.read_text(encoding="utf-8")) == config
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return False
+
+
+async def _reconcile_managed_edits(db: Database, root: Path) -> None:
+    grouped: dict[str, list[Path]] = {}
+    for entry in list(root.iterdir()):
+        state = _edit_state(entry)
+        if state is not None:
+            grouped.setdefault(state[1], []).append(entry)
+
+    for config_id, entries in grouped.items():
+        row = await db.fetch_one(
+            "SELECT config_json FROM dataset_configs WHERE id = ?",
+            (config_id,),
+        )
+        destination = root / config_id
+        if row is None:
+            for entry in entries:
+                _remove_managed_entry(entry)
+            continue
+
+        config = json.loads(row["config_json"])
+        candidates = ([destination] if destination.exists() else []) + entries
+        matching = next(
+            (
+                candidate
+                for candidate in candidates
+                if _managed_directory_matches_config(candidate, config)
+            ),
+            None,
+        )
+        if matching is not None and matching != destination:
+            if destination.exists():
+                _remove_managed_entry(destination)
+            matching.rename(destination)
+        elif matching is None and not destination.exists():
+            backup = next(
+                (entry for entry in entries if entry.name.startswith(".edit-backup-")),
+                None,
+            )
+            if backup is not None:
+                backup.rename(destination)
+
+        for entry in entries:
+            if entry.exists():
+                _remove_managed_entry(entry)
+
+
 async def reconcile_managed_storage(db: Database, root: Path) -> None:
     """Reconcile interrupted filesystem state against committed config ownership."""
     async with db.write_lock:
+        await _reconcile_managed_edits(db, root)
         for entry in root.iterdir():
             state = _stale_state(entry)
             if state is None:
@@ -93,10 +176,7 @@ async def reconcile_managed_storage(db: Database, root: Path) -> None:
                 raise OSError(
                     f"Preserving '{entry.name}' because its dataset config still exists"
                 )
-            if entry.is_symlink() or entry.is_file():
-                entry.unlink()
-            else:
-                shutil.rmtree(entry)
+            _remove_managed_entry(entry)
 
 
 def _rename_managed_directory(source: Path, destination: Path) -> None:
@@ -257,17 +337,20 @@ async def _captions_from_sidecars(
     return captions
 
 
-def _managed_control_filenames(
-    control_files: list[UploadFile],
-    media_indexes: dict[str, list[int]],
+def _managed_control_names(
+    control_names: list[str],
+    media_names: list[str],
     managed_media_filenames: list[str],
 ) -> list[str]:
     results: list[str] = []
     controls_by_media: dict[int, list[str]] = {}
     seen_control_stems: set[str] = set()
+    media_indexes: dict[str, list[int]] = {}
+    for index, name in enumerate(media_names):
+        media_indexes.setdefault(Path(name).stem.casefold(), []).append(index)
 
-    for upload in control_files:
-        basename = _upload_basename(upload.filename)
+    for control_name in control_names:
+        basename = _upload_basename(control_name)
         path = Path(basename)
         if path.suffix.lower() not in IMAGE_EXTENSIONS:
             raise HTTPException(
@@ -328,6 +411,22 @@ def _managed_control_filenames(
                 ),
             )
     return results
+
+
+def _managed_control_filenames(
+    control_files: list[UploadFile],
+    media_indexes: dict[str, list[int]],
+    managed_media_filenames: list[str],
+) -> list[str]:
+    media_names = [""] * len(managed_media_filenames)
+    for stem, indexes in media_indexes.items():
+        for index in indexes:
+            media_names[index] = stem
+    return _managed_control_names(
+        [_upload_basename(upload.filename) for upload in control_files],
+        media_names,
+        managed_media_filenames,
+    )
 
 
 async def _prepare_managed_batch_dataset(
@@ -594,6 +693,317 @@ def _source_entries(config: dict) -> list[tuple[str, str]]:
         for key in SOURCE_KEYS
         if key in dataset and isinstance(dataset[key], str)
     ]
+
+
+def _relative_managed_id(managed_directory: Path, path: Path) -> str:
+    return path.resolve().relative_to(managed_directory.resolve()).as_posix()
+
+
+def _managed_file_manifest(managed_directory: Path, config: dict) -> dict:
+    datasets_manifest: list[dict] = []
+    for index, dataset in enumerate(config.get("datasets", [])):
+        if not isinstance(dataset, dict):
+            continue
+        if isinstance(dataset.get("image_directory"), str):
+            media_type = "image"
+            source = Path(dataset["image_directory"]).resolve()
+            allowed_extensions = IMAGE_EXTENSIONS
+        elif isinstance(dataset.get("video_directory"), str):
+            media_type = "video"
+            source = Path(dataset["video_directory"]).resolve()
+            allowed_extensions = VIDEO_EXTENSIONS
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="Only directory-backed managed datasets can be edited",
+            )
+
+        if (
+            not source.is_dir()
+            or source == managed_directory
+            or managed_directory not in source.parents
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Managed dataset {index + 1} media directory is unavailable",
+            )
+
+        media_files = []
+        for path in sorted(
+            source.iterdir(), key=lambda candidate: candidate.name.casefold()
+        ):
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.suffix.lower() not in allowed_extensions
+            ):
+                continue
+            caption_path = path.with_suffix(CAPTION_EXTENSION)
+            try:
+                caption = caption_path.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeDecodeError) as error:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Caption for managed file '{path.name}' is unavailable",
+                ) from error
+            media_files.append(
+                {
+                    "path": _relative_managed_id(managed_directory, path),
+                    "name": path.name,
+                    "size_bytes": path.stat(follow_symlinks=False).st_size,
+                    "caption": caption,
+                }
+            )
+
+        control_files = []
+        control_value = dataset.get("control_directory")
+        if isinstance(control_value, str):
+            control_directory = Path(control_value).resolve()
+            if (
+                not control_directory.is_dir()
+                or control_directory == managed_directory
+                or managed_directory not in control_directory.parents
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Managed dataset {index + 1} control directory is unavailable",
+                )
+            for path in sorted(
+                control_directory.iterdir(),
+                key=lambda candidate: candidate.name.casefold(),
+            ):
+                if (
+                    path.is_symlink()
+                    or not path.is_file()
+                    or path.suffix.lower() not in IMAGE_EXTENSIONS
+                ):
+                    continue
+                control_files.append(
+                    {
+                        "path": _relative_managed_id(managed_directory, path),
+                        "name": path.name,
+                        "size_bytes": path.stat(follow_symlinks=False).st_size,
+                    }
+                )
+
+        datasets_manifest.append(
+            {
+                "index": index,
+                "media_type": media_type,
+                "files": media_files,
+                "control_files": control_files,
+            }
+        )
+    return {"datasets": datasets_manifest}
+
+
+def _manifest_file_maps(managed_directory: Path, manifest: dict) -> tuple[dict, dict]:
+    media_files: dict[str, dict] = {}
+    control_files: dict[str, dict] = {}
+    for dataset in manifest["datasets"]:
+        for media in dataset["files"]:
+            media_files[media["path"]] = {
+                **media,
+                "media_type": dataset["media_type"],
+                "source": managed_directory / Path(media["path"]),
+            }
+        for control in dataset["control_files"]:
+            control_files[control["path"]] = {
+                **control,
+                "source": managed_directory / Path(control["path"]),
+            }
+    return media_files, control_files
+
+
+async def _prepare_managed_update_dataset(
+    spec: object,
+    files: list[UploadFile],
+    caption_files: list[UploadFile],
+    control_files: list[UploadFile],
+    index: int,
+    available_media: dict[str, dict],
+    available_controls: dict[str, dict],
+    claimed_media: set[str],
+    claimed_controls: set[str],
+) -> dict:
+    label = f"dataset_specs[{index}]"
+    if not isinstance(spec, dict):
+        raise HTTPException(status_code=422, detail=f"{label} must be an object")
+
+    media_type = spec.get("media_type")
+    if media_type not in {"image", "video"}:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.media_type must be 'image' or 'video'",
+        )
+    resolution = spec.get("resolution")
+    if not (
+        isinstance(resolution, list)
+        and len(resolution) == 2
+        and all(_positive_int(value) for value in resolution)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.resolution must be an array of two positive integers",
+        )
+    num_repeats = spec.get("num_repeats", 1)
+    if not _positive_int(num_repeats):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.num_repeats must be a positive integer",
+        )
+    target_frames = spec.get("target_frames")
+    if target_frames is not None and (
+        not isinstance(target_frames, list)
+        or not target_frames
+        or not all(_positive_int(value) for value in target_frames)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.target_frames must be a non-empty array of positive integers",
+        )
+    if media_type == "video" and target_frames is None:
+        target_frames = [1]
+    if media_type == "image" and target_frames is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.target_frames only applies to video datasets",
+        )
+
+    existing_specs = spec.get("existing_files", [])
+    if not isinstance(existing_specs, list):
+        raise HTTPException(
+            status_code=422, detail=f"{label}.existing_files must be an array"
+        )
+    existing_files: list[dict] = []
+    for existing in existing_specs:
+        if not isinstance(existing, dict):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label}.existing_files entries must be objects",
+            )
+        path = existing.get("path")
+        caption = existing.get("caption")
+        current = available_media.get(path) if isinstance(path, str) else None
+        if (
+            current is None
+            or current["media_type"] != media_type
+            or path in claimed_media
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label}.existing_files contains an unknown or duplicate path",
+            )
+        if not isinstance(caption, str) or not caption.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label}.existing_files captions must not be empty",
+            )
+        claimed_media.add(path)
+        existing_files.append({**current, "caption": caption.strip()})
+
+    captions = spec.get("captions", [])
+    if not isinstance(captions, list) or not all(
+        isinstance(caption, str) for caption in captions
+    ):
+        raise HTTPException(
+            status_code=422, detail=f"{label}.captions must be an array of strings"
+        )
+    if len(captions) != len(files):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.captions must contain one entry for each uploaded file",
+        )
+    parsed_captions = list(captions)
+    media_indexes = _media_stem_indexes(files)
+    sidecar_captions = await _captions_from_sidecars(caption_files, media_indexes)
+    for media_index, caption in sidecar_captions.items():
+        parsed_captions[media_index] = caption
+    if any(not caption.strip() for caption in parsed_captions):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.captions must not contain empty or whitespace-only entries",
+        )
+    if not existing_files and not files:
+        raise HTTPException(
+            status_code=422, detail=f"{label} must contain at least one media file"
+        )
+
+    allowed_extensions = IMAGE_EXTENSIONS if media_type == "image" else VIDEO_EXTENSIONS
+    used_stems: set[str] = set()
+    managed_filenames: list[str] = []
+    media_names: list[str] = []
+    for existing in existing_files:
+        stem = Path(existing["name"]).stem.casefold()
+        if stem in used_stems:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label} contains duplicate existing media stems",
+            )
+        used_stems.add(stem)
+        managed_filenames.append(existing["name"])
+        media_names.append(existing["name"])
+    for upload in files:
+        filename = _managed_filename(upload.filename, used_stems)
+        if Path(filename).suffix.lower() not in allowed_extensions:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Unsupported {media_type} file extension in {label}: "
+                    f"{Path(filename).suffix or '(none)'}"
+                ),
+            )
+        managed_filenames.append(filename)
+        media_names.append(_upload_basename(upload.filename))
+
+    existing_control_paths = spec.get("existing_control_files", [])
+    if not isinstance(existing_control_paths, list) or not all(
+        isinstance(path, str) for path in existing_control_paths
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.existing_control_files must be an array of paths",
+        )
+    existing_controls: list[dict] = []
+    for path in existing_control_paths:
+        current = available_controls.get(path)
+        if current is None or path in claimed_controls:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{label}.existing_control_files contains an unknown or duplicate path"
+                ),
+            )
+        claimed_controls.add(path)
+        existing_controls.append(current)
+
+    if (existing_controls or control_files) and media_type != "image":
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}: control images are supported only for image datasets",
+        )
+    control_names = [control["name"] for control in existing_controls] + [
+        _upload_basename(upload.filename) for upload in control_files
+    ]
+    managed_control_filenames = (
+        _managed_control_names(control_names, media_names, managed_filenames)
+        if control_names
+        else []
+    )
+
+    return {
+        "media_type": media_type,
+        "resolution": resolution,
+        "num_repeats": num_repeats,
+        "target_frames": target_frames,
+        "existing_files": existing_files,
+        "files": files,
+        "captions": [caption.strip() for caption in parsed_captions],
+        "managed_filenames": managed_filenames,
+        "existing_controls": existing_controls,
+        "control_files": control_files,
+        "managed_control_filenames": managed_control_filenames,
+    }
 
 
 @router.get("")
@@ -980,7 +1390,9 @@ async def create_managed_dataset_batch(
         for index, spec in enumerate(parsed_specs):
             label = f"dataset_specs[{index}]"
             if not isinstance(spec, dict):
-                raise HTTPException(status_code=422, detail=f"{label} must be an object")
+                raise HTTPException(
+                    status_code=422, detail=f"{label} must be an object"
+                )
             file_count = spec.get("file_count")
             caption_file_count = spec.get("caption_file_count", 0)
             control_file_count = spec.get("control_file_count", 0)
@@ -1004,12 +1416,8 @@ async def create_managed_dataset_batch(
                 (
                     spec,
                     files[file_offset : file_offset + file_count],
-                    caption_files[
-                        caption_offset : caption_offset + caption_file_count
-                    ],
-                    control_files[
-                        control_offset : control_offset + control_file_count
-                    ],
+                    caption_files[caption_offset : caption_offset + caption_file_count],
+                    control_files[control_offset : control_offset + control_file_count],
                 )
             )
             file_offset += file_count
@@ -1258,7 +1666,423 @@ async def import_dataset(
 @router.get("/{config_id}")
 async def read_dataset(config_id: str, request: Request) -> dict:
     row = await _get_row(_db(request), config_id)
-    return _resource(row)
+    resource = _resource(row)
+    config = json.loads(row["config_json"])
+    resource["managed"] = (
+        _owned_managed_directory(request, config_id, config) is not None
+    )
+    return resource
+
+
+@router.get("/{config_id}/managed-files")
+async def read_managed_dataset_files(config_id: str, request: Request) -> dict:
+    row = await _get_row(_db(request), config_id)
+    config = json.loads(row["config_json"])
+    managed_directory = _owned_managed_directory(request, config_id, config)
+    if managed_directory is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Only server-managed dataset files can be edited",
+        )
+    return _managed_file_manifest(managed_directory, config)
+
+
+@router.put("/{config_id}/managed")
+async def update_managed_dataset_files(
+    config_id: str,
+    request: Request,
+    name: str = Form(...),
+    dataset_specs: str = Form(...),
+    description: str | None = Form(None),
+    files: list[UploadFile] | None = File(None),
+    caption_files: list[UploadFile] | None = File(None),
+    control_files: list[UploadFile] | None = File(None),
+) -> dict:
+    """Replace a managed config while retaining selected owned files."""
+    db = _db(request)
+    clean_name = name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=422, detail="name must not be empty")
+    clean_description = (
+        description.strip() if description and description.strip() else None
+    )
+    parsed_specs = _json_form_value(dataset_specs, "dataset_specs")
+    if not isinstance(parsed_specs, list) or not parsed_specs:
+        raise HTTPException(
+            status_code=422, detail="dataset_specs must be a non-empty JSON array"
+        )
+
+    files = files or []
+    caption_files = caption_files or []
+    control_files = control_files or []
+    settings = request.app.state.settings
+    upload_count = len(files) + len(caption_files) + len(control_files)
+    if upload_count > settings.managed_max_files:
+        raise HTTPException(
+            status_code=413,
+            detail=f"A managed dataset upload may contain at most {settings.managed_max_files} files",
+        )
+
+    try:
+        existing_row = await _get_row(db, config_id)
+        existing_config = json.loads(existing_row["config_json"])
+        managed_directory = _owned_managed_directory(
+            request, config_id, existing_config
+        )
+        if managed_directory is None or not managed_directory.is_dir():
+            raise HTTPException(
+                status_code=422,
+                detail="Only server-managed dataset files can be edited",
+            )
+        manifest = _managed_file_manifest(managed_directory, existing_config)
+        available_media, available_controls = _manifest_file_maps(
+            managed_directory, manifest
+        )
+
+        file_offset = 0
+        caption_offset = 0
+        control_offset = 0
+        grouped_uploads: list[
+            tuple[object, list[UploadFile], list[UploadFile], list[UploadFile]]
+        ] = []
+        for index, spec in enumerate(parsed_specs):
+            label = f"dataset_specs[{index}]"
+            if not isinstance(spec, dict):
+                raise HTTPException(
+                    status_code=422, detail=f"{label} must be an object"
+                )
+            file_count = spec.get("file_count", 0)
+            caption_file_count = spec.get("caption_file_count", 0)
+            control_file_count = spec.get("control_file_count", 0)
+            if not _non_negative_int(file_count):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}.file_count must be a non-negative integer",
+                )
+            if not _non_negative_int(caption_file_count):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}.caption_file_count must be a non-negative integer",
+                )
+            if not _non_negative_int(control_file_count):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}.control_file_count must be a non-negative integer",
+                )
+            grouped_uploads.append(
+                (
+                    spec,
+                    files[file_offset : file_offset + file_count],
+                    caption_files[caption_offset : caption_offset + caption_file_count],
+                    control_files[control_offset : control_offset + control_file_count],
+                )
+            )
+            file_offset += file_count
+            caption_offset += caption_file_count
+            control_offset += control_file_count
+
+        if file_offset != len(files):
+            raise HTTPException(
+                status_code=422,
+                detail="dataset_specs file counts do not match the uploaded media files",
+            )
+        if caption_offset != len(caption_files):
+            raise HTTPException(
+                status_code=422,
+                detail="dataset_specs caption file counts do not match the uploaded caption files",
+            )
+        if control_offset != len(control_files):
+            raise HTTPException(
+                status_code=422,
+                detail="dataset_specs control file counts do not match the uploaded control files",
+            )
+
+        claimed_media: set[str] = set()
+        claimed_controls: set[str] = set()
+        prepared_datasets = [
+            await _prepare_managed_update_dataset(
+                spec,
+                dataset_files,
+                dataset_caption_files,
+                dataset_control_files,
+                index,
+                available_media,
+                available_controls,
+                claimed_media,
+                claimed_controls,
+            )
+            for index, (
+                spec,
+                dataset_files,
+                dataset_caption_files,
+                dataset_control_files,
+            ) in enumerate(grouped_uploads)
+        ]
+
+        token = str(uuid.uuid4())
+        temporary_directory = (
+            settings.managed_datasets_dir / f".edit-{config_id}-{token}"
+        )
+        backup_directory = (
+            settings.managed_datasets_dir / f".edit-backup-{config_id}-{token}"
+        )
+        datasets: list[dict] = []
+        dataset_locations: list[tuple[Path, Path, Path]] = []
+        for index, prepared in enumerate(prepared_datasets, start=1):
+            final_dataset_directory = managed_directory / f"dataset-{index}"
+            final_media_directory = final_dataset_directory / "media"
+            final_cache_directory = final_dataset_directory / "cache"
+            final_control_directory = final_dataset_directory / "control"
+            temporary_dataset_directory = temporary_directory / f"dataset-{index}"
+            media_directory = temporary_dataset_directory / "media"
+            cache_directory = temporary_dataset_directory / "cache"
+            control_directory = temporary_dataset_directory / "control"
+            dataset_locations.append(
+                (media_directory, cache_directory, control_directory)
+            )
+
+            source_key = (
+                "image_directory"
+                if prepared["media_type"] == "image"
+                else "video_directory"
+            )
+            dataset = {
+                source_key: str(final_media_directory.resolve()),
+                "cache_directory": str(final_cache_directory.resolve()),
+                "resolution": prepared["resolution"],
+                "num_repeats": prepared["num_repeats"],
+            }
+            if prepared["existing_controls"] or prepared["control_files"]:
+                dataset["control_directory"] = str(final_control_directory.resolve())
+            if prepared["media_type"] == "video":
+                dataset.update(
+                    {
+                        "target_frames": prepared["target_frames"],
+                        "frame_extraction": "head",
+                    }
+                )
+            datasets.append(dataset)
+
+        config = normalize_config({"caption_extension": ".txt"}, datasets)
+        warnings = _validate_or_422(config["general"], config["datasets"])
+        config_toml = render_toml(config)
+        caption_bytes = sum(
+            len(file["caption"].encode("utf-8"))
+            for prepared in prepared_datasets
+            for file in prepared["existing_files"]
+        ) + sum(
+            len(caption.encode("utf-8"))
+            for prepared in prepared_datasets
+            for caption in prepared["captions"]
+        )
+
+        async with request.app.state.managed_storage_lock:
+            try:
+                await reconcile_managed_storage(db, settings.managed_datasets_dir)
+                latest_row = await db.fetch_one(
+                    "SELECT updated_at FROM dataset_configs WHERE id = ?",
+                    (config_id,),
+                )
+                if latest_row is None:
+                    raise HTTPException(
+                        status_code=404, detail="Unknown dataset config"
+                    )
+                if latest_row["updated_at"] != existing_row["updated_at"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The dataset changed while it was being edited; reload and try again",
+                    )
+                existing_bytes = _managed_storage_bytes(settings.managed_datasets_dir)
+                current_bytes = _managed_storage_bytes(managed_directory)
+            except OSError as error:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not clean or measure managed dataset storage",
+                ) from error
+            retained_bytes = sum(
+                file["source"].stat(follow_symlinks=False).st_size
+                for prepared in prepared_datasets
+                for file in [
+                    *prepared["existing_files"],
+                    *prepared["existing_controls"],
+                ]
+            )
+            fixed_bytes = (
+                retained_bytes + caption_bytes + len(config_toml.encode("utf-8"))
+            )
+            existing_without_current = max(0, existing_bytes - current_bytes)
+            if (
+                existing_without_current + fixed_bytes
+                > settings.managed_max_storage_bytes
+            ):
+                raise HTTPException(
+                    status_code=413,
+                    detail="Managed dataset storage quota would be exceeded",
+                )
+
+            replaced_directory = False
+            try:
+                total_bytes = 0
+                for prepared, locations in zip(
+                    prepared_datasets, dataset_locations, strict=True
+                ):
+                    media_directory, cache_directory, control_directory = locations
+                    media_directory.mkdir(parents=True)
+                    cache_directory.mkdir()
+                    if prepared["existing_controls"] or prepared["control_files"]:
+                        control_directory.mkdir()
+
+                    existing_count = len(prepared["existing_files"])
+                    for existing, filename in zip(
+                        prepared["existing_files"],
+                        prepared["managed_filenames"][:existing_count],
+                        strict=True,
+                    ):
+                        shutil.copy2(existing["source"], media_directory / filename)
+                        (media_directory / filename).with_suffix(".txt").write_text(
+                            existing["caption"], encoding="utf-8"
+                        )
+                    for upload, filename, caption in zip(
+                        prepared["files"],
+                        prepared["managed_filenames"][existing_count:],
+                        prepared["captions"],
+                        strict=True,
+                    ):
+                        total_bytes = await _write_managed_upload(
+                            upload,
+                            media_directory / filename,
+                            filename,
+                            settings,
+                            total_bytes,
+                            existing_without_current,
+                            fixed_bytes,
+                        )
+                        (media_directory / filename).with_suffix(".txt").write_text(
+                            caption, encoding="utf-8"
+                        )
+
+                    existing_control_count = len(prepared["existing_controls"])
+                    for existing, filename in zip(
+                        prepared["existing_controls"],
+                        prepared["managed_control_filenames"][:existing_control_count],
+                        strict=True,
+                    ):
+                        shutil.copy2(existing["source"], control_directory / filename)
+                    for upload, filename in zip(
+                        prepared["control_files"],
+                        prepared["managed_control_filenames"][existing_control_count:],
+                        strict=True,
+                    ):
+                        total_bytes = await _write_managed_upload(
+                            upload,
+                            control_directory / filename,
+                            filename,
+                            settings,
+                            total_bytes,
+                            existing_without_current,
+                            fixed_bytes,
+                        )
+
+                (temporary_directory / "dataset_config.toml").write_text(
+                    config_toml, encoding="utf-8"
+                )
+                now = utc_now()
+                async with db.write_lock:
+                    current_row = await db.fetch_one(
+                        "SELECT id FROM dataset_configs WHERE id = ?",
+                        (config_id,),
+                    )
+                    if current_row is None:
+                        raise HTTPException(
+                            status_code=404, detail="Unknown dataset config"
+                        )
+                    name_row = await db.fetch_one(
+                        "SELECT id FROM dataset_configs WHERE name = ? AND id != ?",
+                        (clean_name, config_id),
+                    )
+                    if name_row is not None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"A dataset config named '{clean_name}' already exists",
+                        )
+                    job_row = await db.fetch_one(
+                        "SELECT id FROM training_jobs WHERE dataset_config_id = ? LIMIT 1",
+                        (config_id,),
+                    )
+                    if job_row is not None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Managed dataset files cannot be edited while referencing "
+                                "training jobs exist"
+                            ),
+                        )
+                    try:
+                        _rename_managed_directory(managed_directory, backup_directory)
+                        _rename_managed_directory(
+                            temporary_directory, managed_directory
+                        )
+                        replaced_directory = True
+                        await db.connection.execute(
+                            "UPDATE dataset_configs SET name = ?, description = ?, "
+                            "config_json = ?, updated_at = ? WHERE id = ?",
+                            (
+                                clean_name,
+                                clean_description,
+                                json.dumps(config),
+                                now,
+                                config_id,
+                            ),
+                        )
+                        await db.connection.commit()
+                    except BaseException as error:
+                        await db.connection.rollback()
+                        try:
+                            if replaced_directory and managed_directory.exists():
+                                _remove_managed_entry(managed_directory)
+                            if backup_directory.exists():
+                                _rename_managed_directory(
+                                    backup_directory, managed_directory
+                                )
+                        except OSError as restore_error:
+                            raise HTTPException(
+                                status_code=500,
+                                detail=(
+                                    "Managed dataset update failed and recovery is pending"
+                                ),
+                            ) from restore_error
+                        if isinstance(error, HTTPException):
+                            raise error
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                "Managed dataset update failed; its original files were restored"
+                            ),
+                        ) from error
+
+                if backup_directory.exists():
+                    try:
+                        _remove_managed_entry(backup_directory)
+                    except OSError:
+                        pass
+                return {
+                    "id": config_id,
+                    "name": clean_name,
+                    "description": clean_description,
+                    "general": config["general"],
+                    "datasets": config["datasets"],
+                    "created_at": existing_row["created_at"],
+                    "updated_at": now,
+                    "warnings": warnings,
+                    "managed": True,
+                }
+            except BaseException:
+                if temporary_directory.exists():
+                    _remove_managed_entry(temporary_directory)
+                raise
+    finally:
+        for upload in [*files, *caption_files, *control_files]:
+            await upload.close()
 
 
 @router.put("/{config_id}")
@@ -1289,14 +2113,10 @@ async def update_dataset(
     if managed_directory is not None:
         old_sources = _source_entries(existing_config)
         new_sources = _source_entries(config)
-        if (
-            len(old_sources) != len(new_sources)
-            or any(
-                old_key != new_key
-                or Path(old_path).resolve() != Path(new_path).resolve()
-                for (old_key, old_path), (new_key, new_path) in zip(
-                    old_sources, new_sources, strict=True
-                )
+        if len(old_sources) != len(new_sources) or any(
+            old_key != new_key or Path(old_path).resolve() != Path(new_path).resolve()
+            for (old_key, old_path), (new_key, new_path) in zip(
+                old_sources, new_sources, strict=True
             )
         ):
             raise HTTPException(

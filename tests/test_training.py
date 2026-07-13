@@ -292,6 +292,7 @@ def test_jobs_queue_until_started_then_run_fifo(training_client):
     ]
     assert done_first["progress"]["percent"] == 100
     assert done_first["progress"]["epoch"] == 2
+    assert done_first["progress"]["total_epochs"] == 2
     assert done_first["progress"]["step"] == 10
 
     logs = training_client.get(
@@ -306,12 +307,13 @@ def test_jobs_queue_until_started_then_run_fifo(training_client):
     assert paused.json()["state"] == "paused"
 
 
-def test_completed_job_lists_and_downloads_all_lora_artifacts(training_client, paths):
+def test_job_lists_and_downloads_all_lora_artifacts(training_client, paths):
     dataset_id = make_dataset(training_client)
     job = make_job(training_client, dataset_id, name="artifact job")
 
     pending = training_client.get(f"/api/training/jobs/{job['id']}/artifacts")
-    assert pending.status_code == 409
+    assert pending.status_code == 200
+    assert pending.json() == {"files": [], "total_size_bytes": 0}
 
     training_client.post("/api/training/queue/start")
     wait_for(lambda: get_job(training_client, job["id"])["status"] == "completed")
@@ -350,6 +352,48 @@ def test_completed_job_lists_and_downloads_all_lora_artifacts(training_client, p
     with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
         assert archive.namelist() == sorted(expected)
         assert {name: archive.read(name) for name in archive.namelist()} == expected
+
+
+def test_running_job_exposes_completed_epoch_artifacts(training_client, paths):
+    dataset_id = make_dataset(training_client)
+    job = make_job(
+        training_client,
+        dataset_id,
+        name="running artifacts",
+        stub_mode="slow",
+    )
+    training_client.post("/api/training/queue/start")
+    wait_for(
+        lambda: (
+            (data := get_job(training_client, job["id"]))["status"] == "running"
+            and data["current_stage"] == "train"
+        )
+    )
+
+    output_dir = paths["workspace"] / "lora_training" / "outputs"
+    output_dir.mkdir(parents=True)
+    checkpoint = output_dir / "char_v3-000001.safetensors"
+    checkpoint.write_bytes(b"epoch-one")
+
+    listed = training_client.get(f"/api/training/jobs/{job['id']}/artifacts")
+    assert listed.status_code == 200
+    assert listed.json() == {
+        "files": [{"name": checkpoint.name, "size_bytes": len(b"epoch-one")}],
+        "total_size_bytes": len(b"epoch-one"),
+    }
+
+    downloaded = training_client.get(
+        f"/api/training/jobs/{job['id']}/artifacts/download"
+    )
+    assert downloaded.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
+        assert archive.namelist() == [checkpoint.name]
+        assert archive.read(checkpoint.name) == b"epoch-one"
+
+    assert (
+        training_client.post(f"/api/training/jobs/{job['id']}/cancel").status_code
+        == 200
+    )
 
 
 def test_completed_job_with_no_lora_artifacts_has_no_download(training_client):

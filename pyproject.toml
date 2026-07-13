@@ -9,7 +9,16 @@ dependencies = [
     "aiosqlite>=0.20",
     "tomli-w>=1.0",
     "python-multipart>=0.0.9",
+    "psutil>=7.2",
 ]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app", "app.*"]
+namespaces = false
 
 [dependency-groups]
 dev = [
