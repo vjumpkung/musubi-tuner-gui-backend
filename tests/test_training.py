@@ -5,6 +5,7 @@ import shutil
 import sys
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -303,6 +304,67 @@ def test_jobs_queue_until_started_then_run_fifo(training_client):
 
     paused = training_client.post("/api/training/queue/pause")
     assert paused.json()["state"] == "paused"
+
+
+def test_completed_job_lists_and_downloads_all_lora_artifacts(training_client, paths):
+    dataset_id = make_dataset(training_client)
+    job = make_job(training_client, dataset_id, name="artifact job")
+
+    pending = training_client.get(f"/api/training/jobs/{job['id']}/artifacts")
+    assert pending.status_code == 409
+
+    training_client.post("/api/training/queue/start")
+    wait_for(lambda: get_job(training_client, job["id"])["status"] == "completed")
+
+    output_dir = paths["workspace"] / "lora_training" / "outputs"
+    output_dir.mkdir(parents=True)
+    expected = {
+        "char_v3-000001.safetensors": b"epoch-one",
+        "char_v3-000002.safetensors": b"epoch-two",
+        "char_v3.safetensors": b"final",
+    }
+    for name, content in expected.items():
+        (output_dir / name).write_bytes(content)
+    (output_dir / "char_v30-000001.safetensors").write_bytes(b"another job")
+    (output_dir / "char_v3-000002.json").write_text("{}")
+
+    listed = training_client.get(f"/api/training/jobs/{job['id']}/artifacts")
+    assert listed.status_code == 200
+    assert listed.json() == {
+        "files": [
+            {"name": name, "size_bytes": len(content)}
+            for name, content in sorted(expected.items())
+        ],
+        "total_size_bytes": sum(map(len, expected.values())),
+    }
+
+    downloaded = training_client.get(
+        f"/api/training/jobs/{job['id']}/artifacts/download"
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.headers["content-type"] == "application/zip"
+    assert (
+        f"char_v3-{job['id'][:8]}-loras.zip"
+        in downloaded.headers["content-disposition"]
+    )
+    with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
+        assert archive.namelist() == sorted(expected)
+        assert {name: archive.read(name) for name in archive.namelist()} == expected
+
+
+def test_completed_job_with_no_lora_artifacts_has_no_download(training_client):
+    dataset_id = make_dataset(training_client)
+    job = make_job(training_client, dataset_id)
+    training_client.post("/api/training/queue/start")
+    wait_for(lambda: get_job(training_client, job["id"])["status"] == "completed")
+
+    listed = training_client.get(f"/api/training/jobs/{job['id']}/artifacts")
+    assert listed.json() == {"files": [], "total_size_bytes": 0}
+    downloaded = training_client.get(
+        f"/api/training/jobs/{job['id']}/artifacts/download"
+    )
+    assert downloaded.status_code == 404
+    assert downloaded.json()["detail"] == "No LoRA artifacts found for this job"
 
 
 def test_skip_cache_stages(training_client):

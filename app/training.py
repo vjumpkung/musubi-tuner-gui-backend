@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import uuid
+import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
+from starlette.responses import StreamingResponse
 
 from .command_builder import ExtraArgsError, ValuesError, validate_values
 from .config import Settings
@@ -22,6 +25,7 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 JOB_STATUSES = {"queued", "running", "completed", "failed", "cancelled"}
 STAGE_KEYS = ("cache_latents", "cache_text_encoder", "train")
 LOG_CHUNK_BYTES = 64 * 1024
+ARTIFACT_CHUNK_BYTES = 1024 * 1024
 
 router = APIRouter(prefix="/api/training", tags=["training"])
 
@@ -79,6 +83,94 @@ async def _get_job(db: Database, job_id: str):
     if row is None:
         raise HTTPException(status_code=404, detail="Unknown training job")
     return row
+
+
+def _artifact_paths(row, settings: Settings) -> list[Path]:
+    """Find the LoRA checkpoints produced under this job's output name."""
+    values = json.loads(row["values_json"])
+    output_name = str(values.get("outputName") or "").strip()
+    raw_output_dir = str(values.get("outputDir") or "").strip()
+    if not output_name or not raw_output_dir:
+        return []
+
+    try:
+        output_dir = settings.resolve_inside_workspace(raw_output_dir)
+    except ValueError:
+        return []
+    if not output_dir.is_dir():
+        return []
+
+    exact_name = f"{output_name}.safetensors"
+    checkpoint_prefix = f"{output_name}-"
+    artifacts: list[Path] = []
+    for candidate in output_dir.iterdir():
+        if candidate.name != exact_name and not (
+            candidate.name.startswith(checkpoint_prefix)
+            and candidate.suffix.lower() == ".safetensors"
+        ):
+            continue
+        try:
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.parent == output_dir:
+            artifacts.append(resolved)
+    return sorted(artifacts, key=lambda path: path.name)
+
+
+class _ZipBuffer:
+    """A non-seekable sink that lets zipfile emit chunks as they are written."""
+
+    def __init__(self) -> None:
+        self._chunks: list[bytes] = []
+        self._position = 0
+
+    def write(self, data: bytes) -> int:
+        chunk = bytes(data)
+        self._chunks.append(chunk)
+        self._position += len(chunk)
+        return len(chunk)
+
+    def tell(self) -> int:
+        return self._position
+
+    def flush(self) -> None:
+        pass
+
+    def drain(self) -> bytes:
+        chunk = b"".join(self._chunks)
+        self._chunks.clear()
+        return chunk
+
+
+def _zip_artifacts(artifacts: list[Path]) -> Iterator[bytes]:
+    """Stream an uncompressed ZIP without duplicating large checkpoints on disk."""
+    buffer = _ZipBuffer()
+    with zipfile.ZipFile(
+        buffer, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True
+    ) as archive:
+        for artifact in artifacts:
+            with (
+                artifact.open("rb") as source,
+                archive.open(artifact.name, mode="w", force_zip64=True) as destination,
+            ):
+                while chunk := source.read(ARTIFACT_CHUNK_BYTES):
+                    destination.write(chunk)
+                    if emitted := buffer.drain():
+                        yield emitted
+            if emitted := buffer.drain():
+                yield emitted
+    if emitted := buffer.drain():
+        yield emitted
+
+
+def _artifact_archive_name(row) -> str:
+    values = json.loads(row["values_json"])
+    output_name = str(values.get("outputName") or row["name"])
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", output_name).strip("-._")
+    return f"{safe_name or 'training'}-{row['id'][:8]}-loras.zip"
 
 
 def _normalize_values(values: dict[str, Any]) -> dict[str, Any]:
@@ -290,6 +382,52 @@ async def list_jobs(
 @router.get("/jobs/{job_id}")
 async def read_job(job_id: str, request: Request) -> dict:
     return _job_response(await _get_job(_db(request), job_id))
+
+
+@router.get("/jobs/{job_id}/artifacts")
+async def list_job_artifacts(job_id: str, request: Request) -> dict:
+    row = await _get_job(_db(request), job_id)
+    if row["status"] != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail="LoRA artifacts are available after training completes",
+        )
+    artifacts = _artifact_paths(row, _settings(request))
+    files = []
+    for artifact in artifacts:
+        try:
+            files.append({"name": artifact.name, "size_bytes": artifact.stat().st_size})
+        except OSError:
+            continue
+    return {
+        "files": files,
+        "total_size_bytes": sum(file["size_bytes"] for file in files),
+    }
+
+
+@router.get("/jobs/{job_id}/artifacts/download")
+async def download_job_artifacts(job_id: str, request: Request) -> StreamingResponse:
+    row = await _get_job(_db(request), job_id)
+    if row["status"] != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail="LoRA artifacts are available after training completes",
+        )
+    artifacts = _artifact_paths(row, _settings(request))
+    if not artifacts:
+        raise HTTPException(
+            status_code=404, detail="No LoRA artifacts found for this job"
+        )
+
+    return StreamingResponse(
+        _zip_artifacts(artifacts),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{_artifact_archive_name(row)}"'
+            )
+        },
+    )
 
 
 @router.get("/jobs/{job_id}/logs")
