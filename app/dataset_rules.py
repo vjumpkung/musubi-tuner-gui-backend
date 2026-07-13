@@ -65,6 +65,10 @@ def _is_non_empty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def _is_valid_resolution(value: object) -> bool:
     if _is_number(value):
         return True
@@ -99,6 +103,8 @@ def validate_config(general: object, datasets: object) -> tuple[list[str], list[
         errors.append(
             "general: resolution must be a number or an array of one or two integers"
         )
+    if "num_repeats" in general and not _is_positive_int(general["num_repeats"]):
+        errors.append("general: num_repeats must be a positive integer")
 
     cache_directories: dict[str, int] = {}
 
@@ -137,6 +143,10 @@ def validate_config(general: object, datasets: object) -> tuple[list[str], list[
             errors.append(
                 f"{label}: resolution must be a number or an array of one or two integers"
             )
+        if "num_repeats" in dataset and not _is_positive_int(
+            dataset["num_repeats"]
+        ):
+            errors.append(f"{label}: num_repeats must be a positive integer")
 
         if source_key in DIRECTORY_SOURCE_KEYS:
             caption_extension = dataset.get(

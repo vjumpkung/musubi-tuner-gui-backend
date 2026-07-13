@@ -15,6 +15,7 @@ import tomli_w
 from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel
 
+from .config import Settings
 from .dataset_rules import (
     JSONL_SOURCE_KEYS,
     SOURCE_KEYS,
@@ -138,6 +139,10 @@ def _json_form_value(raw: str, field_name: str) -> object:
 
 def _positive_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _non_negative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _upload_basename(filename: str | None) -> str:
@@ -325,6 +330,176 @@ def _managed_control_filenames(
     return results
 
 
+async def _prepare_managed_batch_dataset(
+    spec: object,
+    files: list[UploadFile],
+    caption_files: list[UploadFile],
+    control_files: list[UploadFile],
+    index: int,
+) -> dict:
+    label = f"dataset_specs[{index}]"
+    if not isinstance(spec, dict):
+        raise HTTPException(status_code=422, detail=f"{label} must be an object")
+
+    media_type = spec.get("media_type")
+    if media_type not in {"image", "video"}:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.media_type must be 'image' or 'video'",
+        )
+    if not files:
+        raise HTTPException(
+            status_code=422, detail=f"{label} must contain at least one media file"
+        )
+
+    resolution = spec.get("resolution")
+    if not (
+        isinstance(resolution, list)
+        and len(resolution) == 2
+        and all(_positive_int(value) for value in resolution)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.resolution must be an array of two positive integers",
+        )
+
+    num_repeats = spec.get("num_repeats", 1)
+    if not _positive_int(num_repeats):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.num_repeats must be a positive integer",
+        )
+
+    captions = spec.get("captions")
+    if captions is None:
+        parsed_captions = [""] * len(files)
+    elif not isinstance(captions, list) or not all(
+        isinstance(caption, str) for caption in captions
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.captions must be an array of strings",
+        )
+    elif len(captions) != len(files):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.captions must contain one entry for each media file",
+        )
+    else:
+        parsed_captions = list(captions)
+
+    target_frames = spec.get("target_frames")
+    if target_frames is not None and (
+        not isinstance(target_frames, list)
+        or not target_frames
+        or not all(_positive_int(value) for value in target_frames)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.target_frames must be a non-empty array of positive integers",
+        )
+    if media_type == "video" and target_frames is None:
+        target_frames = [1]
+    if media_type == "image" and target_frames is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.target_frames only applies to video datasets",
+        )
+
+    allowed_extensions = IMAGE_EXTENSIONS if media_type == "image" else VIDEO_EXTENSIONS
+    managed_filenames: list[str] = []
+    used_stems: set[str] = set()
+    for upload in files:
+        filename = _managed_filename(upload.filename, used_stems)
+        if Path(filename).suffix.lower() not in allowed_extensions:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Unsupported {media_type} file extension in {label}: "
+                    f"{Path(filename).suffix or '(none)'}"
+                ),
+            )
+        managed_filenames.append(filename)
+
+    media_indexes = _media_stem_indexes(files)
+    sidecar_captions = await _captions_from_sidecars(caption_files, media_indexes)
+    for media_index, caption in sidecar_captions.items():
+        parsed_captions[media_index] = caption
+    if any(not caption.strip() for caption in parsed_captions):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{label}.captions must not contain empty or whitespace-only entries; "
+                "every media file needs a caption or matching .txt sidecar"
+            ),
+        )
+
+    if control_files and media_type != "image":
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}: control images are supported only for image datasets",
+        )
+    managed_control_filenames = (
+        _managed_control_filenames(control_files, media_indexes, managed_filenames)
+        if control_files
+        else []
+    )
+
+    return {
+        "media_type": media_type,
+        "resolution": resolution,
+        "num_repeats": num_repeats,
+        "target_frames": target_frames,
+        "files": files,
+        "captions": parsed_captions,
+        "control_files": control_files,
+        "managed_filenames": managed_filenames,
+        "managed_control_filenames": managed_control_filenames,
+    }
+
+
+async def _write_managed_upload(
+    upload: UploadFile,
+    destination: Path,
+    display_name: str,
+    settings: Settings,
+    total_bytes: int,
+    existing_bytes: int,
+    fixed_bytes: int,
+) -> int:
+    file_bytes = 0
+    with destination.open("xb") as output:
+        while chunk := await upload.read(1024 * 1024):
+            file_bytes += len(chunk)
+            total_bytes += len(chunk)
+            if file_bytes > settings.managed_max_file_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Uploaded file '{display_name}' exceeds the "
+                        f"{settings.managed_max_file_bytes}-byte limit"
+                    ),
+                )
+            if total_bytes > settings.managed_max_total_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "Managed dataset uploads exceed the "
+                        f"{settings.managed_max_total_bytes}-byte total limit"
+                    ),
+                )
+            if (
+                existing_bytes + fixed_bytes + total_bytes
+                > settings.managed_max_storage_bytes
+            ):
+                raise HTTPException(
+                    status_code=413,
+                    detail="Managed dataset storage quota would be exceeded",
+                )
+            output.write(chunk)
+    return total_bytes
+
+
 def _db(request: Request) -> Database:
     return request.app.state.db
 
@@ -389,7 +564,7 @@ async def _commit_managed_delete(db: Database) -> None:
 def _owned_managed_directory(
     request: Request, config_id: str, config: dict
 ) -> Path | None:
-    """Return this config's managed directory only when its sole source is confined there."""
+    """Return the managed directory when every config source is confined there."""
     managed_root = request.app.state.settings.managed_datasets_dir.resolve()
     candidate = (managed_root / config_id).resolve()
     if candidate.parent != managed_root:
@@ -402,11 +577,12 @@ def _owned_managed_directory(
         for key in SOURCE_KEYS
         if key in dataset and isinstance(dataset[key], str)
     ]
-    if len(source_paths) != 1:
+    if not source_paths:
         return None
-    source = Path(source_paths[0]).resolve()
-    if source != candidate and candidate not in source.parents:
-        return None
+    for source_path in source_paths:
+        source = Path(source_path).resolve()
+        if source != candidate and candidate not in source.parents:
+            return None
     return candidate
 
 
@@ -762,6 +938,278 @@ async def create_managed_dataset(
             await upload.close()
 
 
+@router.post("/managed/batch", status_code=201)
+async def create_managed_dataset_batch(
+    request: Request,
+    name: str = Form(...),
+    dataset_specs: str = Form(...),
+    files: list[UploadFile] = File(...),
+    description: str | None = Form(None),
+    caption_files: list[UploadFile] | None = File(None),
+    control_files: list[UploadFile] | None = File(None),
+) -> dict:
+    """Upload one or more datasets into one managed TOML configuration."""
+    db = _db(request)
+    clean_name = name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=422, detail="name must not be empty")
+
+    parsed_specs = _json_form_value(dataset_specs, "dataset_specs")
+    if not isinstance(parsed_specs, list) or not parsed_specs:
+        raise HTTPException(
+            status_code=422, detail="dataset_specs must be a non-empty JSON array"
+        )
+
+    caption_files = caption_files or []
+    control_files = control_files or []
+    settings = request.app.state.settings
+    upload_count = len(files) + len(caption_files) + len(control_files)
+    if upload_count > settings.managed_max_files:
+        raise HTTPException(
+            status_code=413,
+            detail=f"A managed dataset upload may contain at most {settings.managed_max_files} files",
+        )
+
+    file_offset = 0
+    caption_offset = 0
+    control_offset = 0
+    grouped_uploads: list[
+        tuple[object, list[UploadFile], list[UploadFile], list[UploadFile]]
+    ] = []
+    try:
+        for index, spec in enumerate(parsed_specs):
+            label = f"dataset_specs[{index}]"
+            if not isinstance(spec, dict):
+                raise HTTPException(status_code=422, detail=f"{label} must be an object")
+            file_count = spec.get("file_count")
+            caption_file_count = spec.get("caption_file_count", 0)
+            control_file_count = spec.get("control_file_count", 0)
+            if not _positive_int(file_count):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}.file_count must be a positive integer",
+                )
+            if not _non_negative_int(caption_file_count):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}.caption_file_count must be a non-negative integer",
+                )
+            if not _non_negative_int(control_file_count):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}.control_file_count must be a non-negative integer",
+                )
+
+            grouped_uploads.append(
+                (
+                    spec,
+                    files[file_offset : file_offset + file_count],
+                    caption_files[
+                        caption_offset : caption_offset + caption_file_count
+                    ],
+                    control_files[
+                        control_offset : control_offset + control_file_count
+                    ],
+                )
+            )
+            file_offset += file_count
+            caption_offset += caption_file_count
+            control_offset += control_file_count
+
+        if file_offset != len(files):
+            raise HTTPException(
+                status_code=422,
+                detail="dataset_specs file counts do not match the uploaded media files",
+            )
+        if caption_offset != len(caption_files):
+            raise HTTPException(
+                status_code=422,
+                detail="dataset_specs caption file counts do not match the uploaded caption files",
+            )
+        if control_offset != len(control_files):
+            raise HTTPException(
+                status_code=422,
+                detail="dataset_specs control file counts do not match the uploaded control files",
+            )
+
+        prepared_datasets = [
+            await _prepare_managed_batch_dataset(
+                spec,
+                dataset_files,
+                dataset_caption_files,
+                dataset_control_files,
+                index,
+            )
+            for index, (
+                spec,
+                dataset_files,
+                dataset_caption_files,
+                dataset_control_files,
+            ) in enumerate(grouped_uploads)
+        ]
+
+        if await _name_taken(db, clean_name):
+            raise HTTPException(
+                status_code=409,
+                detail=f"A dataset config named '{clean_name}' already exists",
+            )
+
+        config_id = str(uuid.uuid4())
+        managed_directory = settings.managed_datasets_dir / config_id
+        dataset_locations: list[tuple[Path, Path, Path]] = []
+        datasets: list[dict] = []
+        for index, prepared in enumerate(prepared_datasets, start=1):
+            dataset_directory = managed_directory / f"dataset-{index}"
+            media_directory = dataset_directory / "media"
+            cache_directory = dataset_directory / "cache"
+            control_directory = dataset_directory / "control"
+            dataset_locations.append(
+                (media_directory, cache_directory, control_directory)
+            )
+
+            media_type = prepared["media_type"]
+            source_key = (
+                "image_directory" if media_type == "image" else "video_directory"
+            )
+            dataset = {
+                source_key: str(media_directory.resolve()),
+                "cache_directory": str(cache_directory.resolve()),
+                "resolution": prepared["resolution"],
+                "num_repeats": prepared["num_repeats"],
+            }
+            if prepared["control_files"]:
+                dataset["control_directory"] = str(control_directory.resolve())
+            if media_type == "video":
+                dataset.update(
+                    {
+                        "target_frames": prepared["target_frames"],
+                        "frame_extraction": "head",
+                    }
+                )
+            datasets.append(dataset)
+
+        config = normalize_config({"caption_extension": ".txt"}, datasets)
+        warnings = _validate_or_422(config["general"], config["datasets"])
+        config_toml = render_toml(config)
+        fixed_bytes = len(config_toml.encode("utf-8")) + sum(
+            len(caption.encode("utf-8"))
+            for prepared in prepared_datasets
+            for caption in prepared["captions"]
+        )
+
+        async with request.app.state.managed_storage_lock:
+            try:
+                await reconcile_managed_storage(db, settings.managed_datasets_dir)
+                existing_bytes = _managed_storage_bytes(settings.managed_datasets_dir)
+            except OSError as error:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not clean or measure managed dataset storage",
+                ) from error
+            if existing_bytes + fixed_bytes > settings.managed_max_storage_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Managed dataset storage quota would be exceeded",
+                )
+
+            try:
+                total_bytes = 0
+                for prepared, locations in zip(
+                    prepared_datasets, dataset_locations, strict=True
+                ):
+                    media_directory, cache_directory, control_directory = locations
+                    media_directory.mkdir(parents=True)
+                    cache_directory.mkdir()
+                    if prepared["control_files"]:
+                        control_directory.mkdir()
+
+                    for upload, filename, caption in zip(
+                        prepared["files"],
+                        prepared["managed_filenames"],
+                        prepared["captions"],
+                        strict=True,
+                    ):
+                        total_bytes = await _write_managed_upload(
+                            upload,
+                            media_directory / filename,
+                            filename,
+                            settings,
+                            total_bytes,
+                            existing_bytes,
+                            fixed_bytes,
+                        )
+                        (media_directory / filename).with_suffix(".txt").write_text(
+                            caption, encoding="utf-8"
+                        )
+
+                    for upload, filename in zip(
+                        prepared["control_files"],
+                        prepared["managed_control_filenames"],
+                        strict=True,
+                    ):
+                        total_bytes = await _write_managed_upload(
+                            upload,
+                            control_directory / filename,
+                            filename,
+                            settings,
+                            total_bytes,
+                            existing_bytes,
+                            fixed_bytes,
+                        )
+
+                (managed_directory / "dataset_config.toml").write_text(
+                    config_toml, encoding="utf-8"
+                )
+                now = utc_now()
+                inserted = await _try_dataset_write(
+                    db,
+                    "INSERT INTO dataset_configs "
+                    "(id, name, description, config_json, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        config_id,
+                        clean_name,
+                        description,
+                        json.dumps(config),
+                        now,
+                        now,
+                    ),
+                )
+                if not inserted:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"A dataset config named '{clean_name}' already exists",
+                    )
+                return {
+                    "id": config_id,
+                    "name": clean_name,
+                    "description": description,
+                    "general": config["general"],
+                    "datasets": config["datasets"],
+                    "created_at": now,
+                    "updated_at": now,
+                    "warnings": warnings,
+                }
+            except BaseException as original_error:
+                try:
+                    _cleanup_failed_managed_creation(
+                        settings.managed_datasets_dir,
+                        managed_directory,
+                    )
+                except ManagedCleanupError as cleanup_error:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "Managed dataset creation failed and cleanup is pending in "
+                            f"'{cleanup_error.path.name}'"
+                        ),
+                    ) from cleanup_error
+                raise original_error
+    finally:
+        for upload in [*files, *caption_files, *control_files]:
+            await upload.close()
+
+
 @router.post("/import", status_code=201)
 async def import_dataset(
     request: Request,
@@ -842,14 +1290,18 @@ async def update_dataset(
         old_sources = _source_entries(existing_config)
         new_sources = _source_entries(config)
         if (
-            len(old_sources) != 1
-            or len(new_sources) != 1
-            or old_sources[0][0] != new_sources[0][0]
-            or Path(old_sources[0][1]).resolve() != Path(new_sources[0][1]).resolve()
+            len(old_sources) != len(new_sources)
+            or any(
+                old_key != new_key
+                or Path(old_path).resolve() != Path(new_path).resolve()
+                for (old_key, old_path), (new_key, new_path) in zip(
+                    old_sources, new_sources, strict=True
+                )
+            )
         ):
             raise HTTPException(
                 status_code=422,
-                detail="The source path of a managed dataset cannot be changed",
+                detail="The source paths of a managed dataset config cannot be changed",
             )
 
         config_path = managed_directory / "dataset_config.toml"

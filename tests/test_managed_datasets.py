@@ -44,6 +44,113 @@ def _managed_request(
     return client.post("/api/datasets/managed", data=data, files=files, headers=headers)
 
 
+def _managed_batch_request(client, *, name="multi dataset", specs=None, files=None):
+    specs = specs or [
+        {
+            "media_type": "image",
+            "resolution": [512, 512],
+            "num_repeats": 3,
+            "captions": ["still image"],
+            "file_count": 1,
+            "caption_file_count": 0,
+            "control_file_count": 1,
+        },
+        {
+            "media_type": "video",
+            "resolution": [960, 544],
+            "num_repeats": 2,
+            "target_frames": [1, 25, 49],
+            "captions": ["moving subject"],
+            "file_count": 1,
+            "caption_file_count": 0,
+            "control_file_count": 0,
+        },
+    ]
+    files = files or [
+        ("files", ("still.png", io.BytesIO(b"image"), "image/png")),
+        ("files", ("motion.mp4", io.BytesIO(b"video"), "video/mp4")),
+        ("control_files", ("still.jpg", io.BytesIO(b"control"), "image/jpeg")),
+    ]
+    return client.post(
+        "/api/datasets/managed/batch",
+        data={
+            "name": name,
+            "description": "multiple TOML entries",
+            "dataset_specs": json.dumps(specs),
+        },
+        files=files,
+    )
+
+
+def test_create_managed_batch_writes_multiple_datasets_and_repeats(client, paths):
+    response = _managed_batch_request(client)
+
+    assert response.status_code == 201, response.text
+    created = response.json()
+    assert created["general"] == {"caption_extension": ".txt"}
+    assert len(created["datasets"]) == 2
+
+    managed_dir = paths["data"] / "managed_datasets" / created["id"]
+    image_dataset, video_dataset = created["datasets"]
+    assert image_dataset["resolution"] == [512, 512]
+    assert image_dataset["num_repeats"] == 3
+    assert image_dataset["image_directory"] == str(
+        (managed_dir / "dataset-1" / "media").resolve()
+    )
+    assert image_dataset["control_directory"] == str(
+        (managed_dir / "dataset-1" / "control").resolve()
+    )
+    assert video_dataset["resolution"] == [960, 544]
+    assert video_dataset["num_repeats"] == 2
+    assert video_dataset["target_frames"] == [1, 25, 49]
+    assert video_dataset["video_directory"] == str(
+        (managed_dir / "dataset-2" / "media").resolve()
+    )
+    assert (managed_dir / "dataset-1" / "media" / "still.txt").read_text(
+        encoding="utf-8"
+    ) == "still image"
+    assert (managed_dir / "dataset-2" / "media" / "motion.txt").read_text(
+        encoding="utf-8"
+    ) == "moving subject"
+
+    document = tomllib.loads(
+        (managed_dir / "dataset_config.toml").read_text(encoding="utf-8")
+    )
+    assert len(document["datasets"]) == 2
+    assert [dataset["num_repeats"] for dataset in document["datasets"]] == [3, 2]
+
+    assert client.delete(f"/api/datasets/{created['id']}").status_code == 204
+    assert not managed_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("spec_override", "detail"),
+    [
+        ({"num_repeats": 0}, "num_repeats must be a positive integer"),
+        ({"file_count": 2}, "file counts do not match"),
+    ],
+)
+def test_managed_batch_rejects_invalid_specs(client, spec_override, detail):
+    spec = {
+        "media_type": "image",
+        "resolution": [512, 512],
+        "num_repeats": 1,
+        "captions": ["caption"],
+        "file_count": 1,
+        "caption_file_count": 0,
+        "control_file_count": 0,
+        **spec_override,
+    }
+    response = _managed_batch_request(
+        client,
+        specs=[spec],
+        files=[("files", ("sample.png", io.BytesIO(b"image"), "image/png"))],
+    )
+
+    assert response.status_code == 422
+    assert detail in response.json()["detail"]
+
+
 def test_create_managed_image_dataset_writes_media_captions_and_export(client, paths):
     response = _managed_request(
         client,
@@ -387,7 +494,12 @@ def test_managed_request_content_length_is_rejected_before_parsing(
     assert "request body" in response.json()["detail"]
 
 
-async def test_managed_request_chunked_body_is_counted_before_app_consumes_it():
+@pytest.mark.parametrize(
+    "request_path", ["/api/datasets/managed", "/api/datasets/managed/batch"]
+)
+async def test_managed_request_chunked_body_is_counted_before_app_consumes_it(
+    request_path,
+):
     from app.main import ManagedUploadBodyLimitMiddleware, _ManagedBodyTooLarge
 
     assert issubclass(_ManagedBodyTooLarge, OSError)
@@ -417,8 +529,8 @@ async def test_managed_request_chunked_body_is_counted_before_app_consumes_it():
             "http_version": "1.1",
             "method": "POST",
             "scheme": "http",
-            "path": "/api/datasets/managed",
-            "raw_path": b"/api/datasets/managed",
+            "path": request_path,
+            "raw_path": request_path.encode(),
             "query_string": b"",
             "root_path": "",
             "headers": [],

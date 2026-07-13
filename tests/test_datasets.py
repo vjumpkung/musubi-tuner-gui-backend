@@ -91,6 +91,16 @@ def test_validation_errors_return_422(client):
         },  # JSON values must be representable in TOML
         {
             **VALID_PAYLOAD,
+            "datasets": [
+                {
+                    "image_directory": "/a",
+                    "cache_directory": "/c",
+                    "num_repeats": 0,
+                }
+            ],
+        },  # repeats must be positive
+        {
+            **VALID_PAYLOAD,
             "general": {},
             "datasets": [{"image_directory": "/a", "caption_extension": ".txt"}],
         },  # resolution nowhere

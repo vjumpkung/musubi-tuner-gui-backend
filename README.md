@@ -56,7 +56,9 @@ storage operation; all retained state remains included in quota accounting.
 Managed uploads accept captions entered in the UI or UTF-8 `.txt` sidecars with the same stem as
 their media (`a.png` + `a.txt`). Image datasets may include a separate control-image upload whose
 files use the target stem (`a.jpg` + control `a.png`) or numbered stems such as `a_0.png` and
-`a_0001.png`; the generated TOML includes `control_directory`.
+`a_0001.png`; the generated TOML includes `control_directory`. One managed config can contain
+multiple image and video `[[datasets]]` entries, each with its own resolution, cache directory,
+sampling settings, and `num_repeats` value.
 
 The download scripts are not part of this repository — place the `download_*.sh` files
 listed in the API contract into `scripts/`. Server tools required at runtime: `bash` and

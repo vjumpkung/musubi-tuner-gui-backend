@@ -44,7 +44,8 @@ class ManagedUploadBodyLimitMiddleware:
         if not (
             scope["type"] == "http"
             and scope.get("method") == "POST"
-            and str(scope.get("path", "")).rstrip("/") == "/api/datasets/managed"
+            and str(scope.get("path", "")).rstrip("/")
+            in {"/api/datasets/managed", "/api/datasets/managed/batch"}
         ):
             await self.app(scope, receive, send)
             return
