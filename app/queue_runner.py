@@ -1,4 +1,4 @@
-"""The training queue runner: a single asyncio task that drains queued jobs FIFO."""
+"""The training queue runner: run one queued job per explicit start request."""
 
 from __future__ import annotations
 
@@ -109,6 +109,7 @@ class QueueRunner:
     async def cancel_current(self) -> None:
         """Terminate the currently running job's process tree (cancel endpoint)."""
         self.cancel_requested = True
+        await self.set_state("paused")
         if self.current_process is not None:
             await terminate_tree(self.current_process)
 
@@ -257,6 +258,9 @@ class QueueRunner:
                     self._clear_current(job_id)
                     return
 
+        # A successful job consumes the explicit Start action. Persist the pause before
+        # publishing completion so clients never observe a completed job with a running queue.
+        await self.set_state("paused")
         await self.db.execute(
             "UPDATE training_jobs SET status = 'completed', finished_at = ?, "
             "current_stage = NULL, stages_json = ?, progress_json = ? "
@@ -338,6 +342,7 @@ class QueueRunner:
         )
         if row is None or row["status"] == "cancelled":
             return
+        await self.set_state("paused")
         await self.db.execute(
             "UPDATE training_jobs SET status = 'failed', error = ?, finished_at = ?, "
             "queue_position = NULL, current_stage = NULL, "

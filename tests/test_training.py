@@ -247,7 +247,7 @@ def test_create_validations(training_client):
     assert missing_musubi.status_code == 503
 
 
-def test_jobs_queue_until_started_then_run_fifo(training_client):
+def test_jobs_wait_for_start_and_queue_pauses_after_each_success(training_client):
     dataset_id = make_dataset(training_client)
     first = make_job(training_client, dataset_id, name="first")
     second = make_job(training_client, dataset_id, name="second")
@@ -278,12 +278,29 @@ def test_jobs_queue_until_started_then_run_fifo(training_client):
             and job
         )
     )
+    paused_after_first = training_client.get("/api/training/queue").json()
+    assert paused_after_first == {
+        "state": "paused",
+        "queued": 1,
+        "running_job_id": None,
+    }
+    assert get_job(training_client, second["id"])["status"] == "queued"
+
+    restarted = training_client.post("/api/training/queue/start")
+    assert restarted.status_code == 200
+    assert restarted.json()["state"] == "running"
+
     done_second = wait_for(
         lambda: (
             (job := get_job(training_client, second["id"]))["status"] == "completed"
             and job
         )
     )
+    assert training_client.get("/api/training/queue").json() == {
+        "state": "paused",
+        "queued": 0,
+        "running_job_id": None,
+    }
     assert done_first["finished_at"] <= done_second["started_at"]
     assert [stage["status"] for stage in done_first["stages"]] == [
         "completed",
@@ -303,8 +320,21 @@ def test_jobs_queue_until_started_then_run_fifo(training_client):
     assert body["eof"] is True
     assert body["next_offset"] > 0
 
-    paused = training_client.post("/api/training/queue/pause")
-    assert paused.json()["state"] == "paused"
+
+def test_enqueue_pauses_an_idle_running_queue(training_client):
+    dataset_id = make_dataset(training_client)
+    started = training_client.post("/api/training/queue/start")
+    assert started.json()["state"] == "running"
+
+    job = make_job(training_client, dataset_id)
+    assert job["status"] == "queued"
+    assert training_client.get("/api/training/queue").json() == {
+        "state": "paused",
+        "queued": 1,
+        "running_job_id": None,
+    }
+    time.sleep(1.0)
+    assert get_job(training_client, job["id"])["status"] == "queued"
 
 
 def test_job_lists_and_downloads_all_lora_artifacts(training_client, paths):
@@ -334,11 +364,41 @@ def test_job_lists_and_downloads_all_lora_artifacts(training_client, paths):
     assert listed.status_code == 200
     assert listed.json() == {
         "files": [
-            {"name": name, "size_bytes": len(content)}
-            for name, content in sorted(expected.items())
+            {
+                "name": "char_v3-000001.safetensors",
+                "size_bytes": len(expected["char_v3-000001.safetensors"]),
+                "epoch": 1,
+                "kind": "epoch",
+            },
+            {
+                "name": "char_v3-000002.safetensors",
+                "size_bytes": len(expected["char_v3-000002.safetensors"]),
+                "epoch": 2,
+                "kind": "epoch",
+            },
+            {
+                "name": "char_v3.safetensors",
+                "size_bytes": len(expected["char_v3.safetensors"]),
+                "epoch": None,
+                "kind": "final",
+            },
         ],
         "total_size_bytes": sum(map(len, expected.values())),
     }
+
+    for name, content in expected.items():
+        individual = training_client.get(
+            f"/api/training/jobs/{job['id']}/artifacts/{name}/download"
+        )
+        assert individual.status_code == 200
+        assert individual.content == content
+        assert name in individual.headers["content-disposition"]
+
+    unknown = training_client.get(
+        f"/api/training/jobs/{job['id']}/artifacts/not-this-job.safetensors/download"
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["detail"] == "Unknown LoRA artifact"
 
     downloaded = training_client.get(
         f"/api/training/jobs/{job['id']}/artifacts/download"
@@ -378,7 +438,14 @@ def test_running_job_exposes_completed_epoch_artifacts(training_client, paths):
     listed = training_client.get(f"/api/training/jobs/{job['id']}/artifacts")
     assert listed.status_code == 200
     assert listed.json() == {
-        "files": [{"name": checkpoint.name, "size_bytes": len(b"epoch-one")}],
+        "files": [
+            {
+                "name": checkpoint.name,
+                "size_bytes": len(b"epoch-one"),
+                "epoch": 1,
+                "kind": "epoch",
+            }
+        ],
         "total_size_bytes": len(b"epoch-one"),
     }
 
@@ -409,6 +476,54 @@ def test_completed_job_with_no_lora_artifacts_has_no_download(training_client):
     )
     assert downloaded.status_code == 404
     assert downloaded.json()["detail"] == "No LoRA artifacts found for this job"
+
+
+def test_job_downloads_reusable_training_config_without_secret(training_client):
+    dataset_id = make_dataset(training_client)
+    job = make_job(
+        training_client,
+        dataset_id,
+        name="saved config",
+        skip_cache=True,
+        values={
+            "epochs": "5",
+            "saveEvery": "1",
+            "huggingfaceToken": "hf_secret",
+            "dynamoBackend": "inductor",
+            "dynamoMode": "reduce-overhead",
+            "numProcesses": "2",
+            "numMachines": "1",
+            "numCpuThreadsPerProcess": "4",
+        },
+    )
+
+    response = training_client.get(f"/api/training/jobs/{job['id']}/config/download")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/json"
+    assert "char_v3-training-config.json" in response.headers["content-disposition"]
+    assert "hf_secret" not in response.text
+    assert response.json() == {
+        "schema": "musubi-tuner-gui.training-config",
+        "version": 1,
+        "profileId": "wan-22",
+        "profileName": "WAN 2.2",
+        "exportedAt": job["created_at"],
+        "datasetConfigId": dataset_id,
+        "skipCacheStages": True,
+        "values": {
+            **JOB_VALUES,
+            "stubMode": "ok",
+            "epochs": "5",
+            "saveEvery": "1",
+        },
+        "acceleration": {
+            "dynamoBackend": "inductor",
+            "dynamoMode": "reduce-overhead",
+            "numProcesses": "2",
+            "numMachines": "1",
+            "numCpuThreadsPerProcess": "4",
+        },
+    }
 
 
 def test_skip_cache_stages(training_client):
@@ -450,11 +565,14 @@ def test_failed_stage_marks_job_failed_and_retry_clones(training_client, paths):
         "skipped",
     ]
     assert "boom failure" in failed["error"]
+    assert training_client.get("/api/training/queue").json()["state"] == "paused"
 
     retried = training_client.post(f"/api/training/jobs/{job['id']}/retry")
     assert retried.status_code == 202
     clone = retried.json()
     assert clone["id"] != job["id"]
+    assert clone["status"] == "queued"
+    training_client.post("/api/training/queue/start")
     wait_for(lambda: get_job(training_client, clone["id"])["status"] == "failed")
 
     # Terminal jobs can be deleted; their log file goes too.
@@ -479,6 +597,7 @@ def test_cancel_running_job(training_client):
     cancelled = training_client.post(f"/api/training/jobs/{slow['id']}/cancel")
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancelled"
+    assert training_client.get("/api/training/queue").json()["state"] == "paused"
     stages = {stage["key"]: stage["status"] for stage in cancelled.json()["stages"]}
     assert stages["train"] == "cancelled"
 
@@ -488,8 +607,11 @@ def test_cancel_running_job(training_client):
         == 200
     )
 
-    # The runner moves on to the next job afterwards.
+    # A following job waits for another explicit Start.
     follow_up = make_job(training_client, dataset_id, name="after-cancel")
+    time.sleep(1.0)
+    assert get_job(training_client, follow_up["id"])["status"] == "queued"
+    training_client.post("/api/training/queue/start")
     wait_for(lambda: get_job(training_client, follow_up["id"])["status"] == "completed")
 
 

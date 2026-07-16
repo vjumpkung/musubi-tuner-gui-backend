@@ -12,7 +12,7 @@ from typing import Any, Iterator
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
-from starlette.responses import StreamingResponse
+from starlette.responses import FileResponse, StreamingResponse
 
 from .command_builder import ExtraArgsError, ValuesError, validate_values
 from .config import Settings
@@ -26,6 +26,14 @@ JOB_STATUSES = {"queued", "running", "completed", "failed", "cancelled"}
 STAGE_KEYS = ("cache_latents", "cache_text_encoder", "train")
 LOG_CHUNK_BYTES = 64 * 1024
 ARTIFACT_CHUNK_BYTES = 1024 * 1024
+TRAINING_CONFIG_SCHEMA = "musubi-tuner-gui.training-config"
+ACCELERATION_DEFAULTS = {
+    "dynamoBackend": "no",
+    "dynamoMode": "default",
+    "numProcesses": "1",
+    "numMachines": "1",
+    "numCpuThreadsPerProcess": "",
+}
 
 router = APIRouter(prefix="/api/training", tags=["training"])
 
@@ -168,10 +176,60 @@ def _zip_artifacts(artifacts: list[Path]) -> Iterator[bytes]:
 
 
 def _artifact_archive_name(row) -> str:
+    return f"{_safe_output_name(row)}-{row['id'][:8]}-loras.zip"
+
+
+def _artifact_epoch(row, artifact: Path) -> int | None:
+    values = json.loads(row["values_json"])
+    output_name = str(values.get("outputName") or "").strip()
+    match = re.fullmatch(
+        rf"{re.escape(output_name)}-(\d+)\.safetensors", artifact.name
+    )
+    return int(match.group(1)) if match else None
+
+
+def _artifact_kind(row, artifact: Path) -> str:
+    values = json.loads(row["values_json"])
+    output_name = str(values.get("outputName") or "").strip()
+    if artifact.name == f"{output_name}.safetensors":
+        return "final"
+    return "epoch" if _artifact_epoch(row, artifact) is not None else "checkpoint"
+
+
+def _safe_output_name(row) -> str:
     values = json.loads(row["values_json"])
     output_name = str(values.get("outputName") or row["name"])
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", output_name).strip("-._")
-    return f"{safe_name or 'training'}-{row['id'][:8]}-loras.zip"
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", output_name).strip("-._") or "training"
+
+
+def _training_config(row) -> dict:
+    values = json.loads(row["values_json"])
+    profile = TRAINING_PROFILES.get(row["profile_id"])
+    portable_values = {
+        key: value
+        for key, value in values.items()
+        if key
+        not in {
+            "huggingfaceToken",
+            "skipCacheStages",
+            *ACCELERATION_DEFAULTS,
+        }
+    }
+    acceleration = {
+        key: str(values.get(key, default))
+        for key, default in ACCELERATION_DEFAULTS.items()
+    }
+    return {
+        "schema": TRAINING_CONFIG_SCHEMA,
+        "version": 1,
+        "profileId": row["profile_id"],
+        "profileName": profile.name if profile else row["profile_id"],
+        "exportedAt": row["created_at"],
+        "datasetConfigId": row["dataset_config_id"],
+        "skipCacheStages": bool(values.get("skipCacheStages", False)),
+        "values": portable_values,
+        "acceleration": acceleration,
+    }
 
 
 def _normalize_values(values: dict[str, Any]) -> dict[str, Any]:
@@ -228,6 +286,9 @@ async def _insert_job(
     values: dict[str, Any],
     skip_cache_stages: bool,
 ) -> dict:
+    # Enqueueing is an explicit review point: a new job must wait for Start even
+    # if the queue was left running while idle. An active job is not interrupted.
+    await runner.set_state("paused")
     job_id = str(uuid.uuid4())
     stages = [
         {
@@ -394,9 +455,23 @@ async def list_job_artifacts(job_id: str, request: Request) -> dict:
     files = []
     for artifact in artifacts:
         try:
-            files.append({"name": artifact.name, "size_bytes": artifact.stat().st_size})
+            files.append(
+                {
+                    "name": artifact.name,
+                    "size_bytes": artifact.stat().st_size,
+                    "epoch": _artifact_epoch(row, artifact),
+                    "kind": _artifact_kind(row, artifact),
+                }
+            )
         except OSError:
             continue
+    files.sort(
+        key=lambda file: (
+            {"epoch": 0, "checkpoint": 1, "final": 2}[file["kind"]],
+            file["epoch"] if file["epoch"] is not None else 0,
+            file["name"],
+        )
+    )
     return {
         "files": files,
         "total_size_bytes": sum(file["size_bytes"] for file in files),
@@ -422,6 +497,38 @@ async def download_job_artifacts(job_id: str, request: Request) -> StreamingResp
                 f'attachment; filename="{_artifact_archive_name(row)}"'
             )
         },
+    )
+
+
+@router.get("/jobs/{job_id}/artifacts/{artifact_name}/download")
+async def download_job_artifact(
+    job_id: str, artifact_name: str, request: Request
+) -> FileResponse:
+    row = await _get_job(_db(request), job_id)
+    artifacts = (
+        [] if row["status"] == "queued" else _artifact_paths(row, _settings(request))
+    )
+    artifact = next(
+        (candidate for candidate in artifacts if candidate.name == artifact_name), None
+    )
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Unknown LoRA artifact")
+    return FileResponse(
+        artifact,
+        media_type="application/octet-stream",
+        filename=artifact.name,
+    )
+
+
+@router.get("/jobs/{job_id}/config/download")
+async def download_job_config(job_id: str, request: Request) -> Response:
+    row = await _get_job(_db(request), job_id)
+    filename = f"{_safe_output_name(row)}-training-config.json"
+    content = json.dumps(_training_config(row), indent=4, ensure_ascii=False) + "\n"
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -488,6 +595,8 @@ async def cancel_job(job_id: str, request: Request) -> dict:
             await renumber_queue(db)
     if terminate_running:
         await runner.cancel_current()
+    else:
+        await runner.set_state("paused")
     return _job_response(await _get_job(db, job_id))
 
 
