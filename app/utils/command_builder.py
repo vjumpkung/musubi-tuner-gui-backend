@@ -17,6 +17,7 @@ from ..profiles import CacheCommand, TrainingProfile, When
 EXTRA_ARG_TOKEN = re.compile(r"^[A-Za-z0-9_.\/=:,+()\-]+$")
 
 STAGE_KEYS = ("cache_latents", "cache_text_encoder", "train")
+SAVE_PRECISIONS = ("bf16", "fp16", "fp32")
 
 
 class ExtraArgsError(ValueError):
@@ -77,6 +78,12 @@ def validate_values(profile: TrainingProfile, values: dict) -> None:
     if attention and attention not in profile.attention_options:
         raise ValuesError(
             f"attention must be one of: {', '.join(profile.attention_options)}"
+        )
+
+    save_precision = _text(values, "savePrecision")
+    if save_precision and save_precision not in SAVE_PRECISIONS:
+        raise ValuesError(
+            f"savePrecision must be one of: {', '.join(SAVE_PRECISIONS)}"
         )
 
     parse_extra_args(values)
@@ -153,6 +160,7 @@ def _train_argv(
         *argument("--optimizer_type", "optimizer"),
         *argument("--lr_scheduler", "scheduler"),
         *argument("--mixed_precision", "mixedPrecision"),
+        *argument("--save_precision", "savePrecision"),
         *argument("--timestep_sampling", "timestepSampling"),
         *argument("--weighting_scheme", "weightingScheme"),
         *argument("--logging_dir", "loggingDir"),

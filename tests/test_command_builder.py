@@ -25,6 +25,7 @@ WAN22_VALUES = {
     "learningRate": "1e-4",
     "optimizer": "adamw",
     "mixedPrecision": "fp16",
+    "savePrecision": "bf16",
     "attention": "sdpa",
     "cacheBatchSize": "16",
     "fp8Base": False,
@@ -71,6 +72,7 @@ def test_wan22_stage_argv():
         "high_noise_14B_fp16.safetensors"
     )
     assert train[train.index("--network_module") + 1] == "networks.lora_wan"
+    assert train[train.index("--save_precision") + 1] == "bf16"
     # The snapshot path is forced; the client cannot point the trainer elsewhere.
     assert train[train.index("--dataset_config") + 1] == str(
         Path("/data/jobs/j1/dataset_config.toml")
@@ -114,6 +116,8 @@ def test_validate_values_requires_profile_fields():
         validate_values(profile, {**WAN22_VALUES, "task": "bogus"})
     with pytest.raises(ValuesError, match="attention"):
         validate_values(profile, {**WAN22_VALUES, "attention": "rm -rf"})
+    with pytest.raises(ValuesError, match="savePrecision"):
+        validate_values(profile, {**WAN22_VALUES, "savePrecision": "int8"})
     # i2v-only field is not required for t2v.
     hv = TRAINING_PROFILES["hunyuan-video-1-5"]
     validate_values(

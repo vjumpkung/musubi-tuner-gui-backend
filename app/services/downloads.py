@@ -18,6 +18,8 @@ from ..utils.process import spawn, terminate_tree
 # script_id -> fixed filename. Never accept a filename or shell command from the request.
 SCRIPT_ALLOWLIST: dict[str, str] = {
     "flux2-dev": "download_flux2_dev.sh",
+    "flux2-klein-base-4b": "download_flux2_klein_base_4b.sh",
+    "flux2-klein-base-9b": "download_flux2_klein_base_9b.sh",
     "flux-kontext-dev": "download_flux_kontext_dev.sh",
     "framepack": "download_framepack.sh",
     "hidream-o1": "download_hidream_o1.sh",
@@ -87,7 +89,9 @@ class DownloadManager:
             raise HTTPException(status_code=404, detail="Unknown download job")
         return job
 
-    def start(self, script_id: str, destination_raw: str) -> DownloadJob:
+    def start(
+        self, script_id: str, destination_raw: str, hf_token: str | None = None
+    ) -> DownloadJob:
         filename = SCRIPT_ALLOWLIST.get(script_id)
         if filename is None:
             raise HTTPException(status_code=404, detail="Unknown download script")
@@ -132,14 +136,23 @@ class DownloadManager:
             id=str(uuid.uuid4()), script_id=script_id, destination=destination
         )
         self.jobs[job.id] = job
-        job.task = asyncio.create_task(self._run(job, bash, script_path))
+        job.task = asyncio.create_task(self._run(job, bash, script_path, hf_token))
         return job
 
-    async def _run(self, job: DownloadJob, bash: str, script_path: Path) -> None:
+    async def _run(
+        self,
+        job: DownloadJob,
+        bash: str,
+        script_path: Path,
+        hf_token: str | None,
+    ) -> None:
         if job.status == "cancelled":
             return
         try:
-            job.process = await spawn([bash, str(script_path)], cwd=job.destination)
+            environment = {"HF_TOKEN": hf_token} if hf_token else None
+            job.process = await spawn(
+                [bash, str(script_path)], cwd=job.destination, env=environment
+            )
         except asyncio.CancelledError:
             if job.process is not None:
                 await terminate_tree(job.process)
@@ -164,8 +177,9 @@ class DownloadManager:
             line = raw_line.decode("utf-8", errors="replace").rstrip()
             if not line.strip():
                 continue
-            job.last_lines.append(line)
-            self._apply_line(job, line)
+            safe_line = line.replace(hf_token, "***") if hf_token else line
+            job.last_lines.append(safe_line)
+            self._apply_line(job, safe_line)
 
         return_code = await job.process.wait()
         if job.status == "cancelled":

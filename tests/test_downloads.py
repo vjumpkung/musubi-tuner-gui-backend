@@ -5,6 +5,7 @@ import pytest
 
 from app.config import Settings
 from app.downloads import DownloadManager
+from app.services.downloads import SCRIPT_ALLOWLIST
 
 from .conftest import wait_for
 
@@ -21,6 +22,11 @@ sleep 30
 
 FAILING_SCRIPT = """#!/usr/bin/env bash
 echo "something went wrong"
+exit 3
+"""
+
+TOKEN_LEAK_SCRIPT = """#!/usr/bin/env bash
+echo "token was ${HF_TOKEN:-missing}"
 exit 3
 """
 
@@ -48,6 +54,15 @@ def test_unknown_script_id_returns_404(client):
         "/api/downloads", json={"script_id": "nope", "destination": "."}
     )
     assert response.status_code == 404
+
+
+def test_flux2_klein_base_scripts_are_allowlisted():
+    assert SCRIPT_ALLOWLIST["flux2-klein-base-4b"] == (
+        "download_flux2_klein_base_4b.sh"
+    )
+    assert SCRIPT_ALLOWLIST["flux2-klein-base-9b"] == (
+        "download_flux2_klein_base_9b.sh"
+    )
 
 
 def test_missing_script_file_returns_503(client):
@@ -101,6 +116,28 @@ def test_download_completes_with_progress(client, paths):
     )
     assert done["progress"] == 100
     assert done["current_file"] == "diffusion_models/flux2_dev_fp8mixed.safetensors"
+
+
+def test_hf_token_is_passed_via_environment_and_redacted(client, paths):
+    token = "hf_download_secret"
+    install_script(paths, "download_flux2_dev.sh", TOKEN_LEAK_SCRIPT)
+    response = client.post(
+        "/api/downloads",
+        json={"script_id": "flux2-dev", "destination": ".", "hf_token": token},
+    )
+    assert response.status_code == 202
+    assert token not in response.text
+
+    job_id = response.json()["id"]
+    failed = wait_for(
+        lambda: (
+            (data := client.get(f"/api/downloads/{job_id}").json())["status"]
+            == "failed"
+            and data
+        )
+    )
+    assert "token was ***" in failed["error"]
+    assert token not in str(failed)
 
 
 def test_failed_download_reports_error(client, paths):

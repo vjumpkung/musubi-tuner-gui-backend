@@ -408,7 +408,7 @@ TRAINING_PROFILES: dict[str, TrainingProfile] = {
     ),
     "z-image-turbo": TrainingProfile(
         id="z-image-turbo",
-        name="Z-Image Turbo",
+        name="Z-Image",
         trainer="zimage_train_network.py",
         network_module="networks.lora_zimage",
         cache_commands=(

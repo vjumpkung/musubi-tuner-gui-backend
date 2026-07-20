@@ -14,7 +14,10 @@ def _manager(request: Request) -> DownloadManager:
 
 @router.post("", status_code=202)
 async def start_download(payload: DownloadRequest, request: Request) -> dict:
-    return _manager(request).start(payload.script_id, payload.destination).to_response()
+    hf_token = payload.hf_token.get_secret_value() if payload.hf_token else None
+    return _manager(request).start(
+        payload.script_id, payload.destination, hf_token
+    ).to_response()
 
 
 @router.get("/{job_id}")
