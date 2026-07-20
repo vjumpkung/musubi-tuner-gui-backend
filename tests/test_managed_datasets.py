@@ -44,7 +44,16 @@ def _managed_request(
     return client.post("/api/datasets/managed", data=data, files=files, headers=headers)
 
 
-def _managed_batch_request(client, *, name="multi dataset", specs=None, files=None):
+def _managed_batch_request(
+    client,
+    *,
+    name="multi dataset",
+    specs=None,
+    files=None,
+    batch_size=1,
+    enable_bucket=True,
+    bucket_no_upscale=False,
+):
     specs = specs or [
         {
             "media_type": "image",
@@ -77,9 +86,27 @@ def _managed_batch_request(client, *, name="multi dataset", specs=None, files=No
             "name": name,
             "description": "multiple TOML entries",
             "dataset_specs": json.dumps(specs),
+            "batch_size": str(batch_size),
+            "enable_bucket": str(enable_bucket).lower(),
+            "bucket_no_upscale": str(bucket_no_upscale).lower(),
         },
         files=files,
     )
+
+
+def _staged_session(client):
+    response = client.post("/api/datasets/managed/upload-sessions")
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
+def _stage_file(client, session_id, filename, content, content_type):
+    response = client.post(
+        f"/api/datasets/managed/upload-sessions/{session_id}/files",
+        files={"file": (filename, io.BytesIO(content), content_type)},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["token"]
 
 
 def test_create_managed_batch_writes_multiple_datasets_and_repeats(client, paths):
@@ -87,7 +114,12 @@ def test_create_managed_batch_writes_multiple_datasets_and_repeats(client, paths
 
     assert response.status_code == 201, response.text
     created = response.json()
-    assert created["general"] == {"caption_extension": ".txt"}
+    assert created["general"] == {
+        "caption_extension": ".txt",
+        "batch_size": 1,
+        "enable_bucket": True,
+        "bucket_no_upscale": False,
+    }
     assert len(created["datasets"]) == 2
 
     managed_dir = paths["data"] / "managed_datasets" / created["id"]
@@ -151,6 +183,253 @@ def test_managed_batch_rejects_invalid_specs(client, spec_override, detail):
     assert detail in response.json()["detail"]
 
 
+def test_managed_batch_saves_general_settings_and_additional_toml_options(
+    client, paths
+):
+    spec = {
+        "media_type": "image",
+        "resolution": [1024, 1024],
+        "num_repeats": 1,
+        "additional_options": (
+            "multiple_target = false\n"
+            "no_resize_control = true\n"
+            "control_resolution = [1024, 1024]"
+        ),
+        "captions": ["caption"],
+        "file_count": 1,
+        "caption_file_count": 0,
+        "control_file_count": 0,
+    }
+    response = _managed_batch_request(
+        client,
+        specs=[spec],
+        files=[("files", ("sample.png", io.BytesIO(b"image"), "image/png"))],
+        batch_size=2,
+        enable_bucket=False,
+        bucket_no_upscale=True,
+    )
+
+    assert response.status_code == 201, response.text
+    created = response.json()
+    assert created["general"] == {
+        "caption_extension": ".txt",
+        "batch_size": 2,
+        "enable_bucket": False,
+        "bucket_no_upscale": True,
+    }
+    assert created["datasets"][0]["multiple_target"] is False
+    assert created["datasets"][0]["no_resize_control"] is True
+    assert created["datasets"][0]["control_resolution"] == [1024, 1024]
+
+    document = tomllib.loads(
+        (
+            paths["data"]
+            / "managed_datasets"
+            / created["id"]
+            / "dataset_config.toml"
+        ).read_text(encoding="utf-8")
+    )
+    assert document["general"] == created["general"]
+    assert document["datasets"] == created["datasets"]
+
+
+@pytest.mark.parametrize(
+    ("additional_options", "detail"),
+    [
+        ("not = [valid", "invalid TOML"),
+        ("resolution = [2048, 2048]", "cannot replace managed option"),
+        ("[nested]\nvalue = true", "only key/value options"),
+    ],
+)
+def test_managed_batch_rejects_unsafe_additional_options(
+    client, additional_options, detail
+):
+    spec = {
+        "media_type": "image",
+        "resolution": [512, 512],
+        "num_repeats": 1,
+        "additional_options": additional_options,
+        "captions": ["caption"],
+        "file_count": 1,
+        "caption_file_count": 0,
+        "control_file_count": 0,
+    }
+    response = _managed_batch_request(
+        client,
+        specs=[spec],
+        files=[("files", ("sample.png", io.BytesIO(b"image"), "image/png"))],
+    )
+
+    assert response.status_code == 422
+    assert detail in response.json()["detail"]
+
+
+def test_staged_uploads_finalize_sequential_files(client, paths):
+    session_id = _staged_session(client)
+    first_token = _stage_file(
+        client, session_id, "first.png", b"first image", "image/png"
+    )
+    second_token = _stage_file(
+        client, session_id, "second.png", b"second image", "image/png"
+    )
+    payload = {
+        "name": "sequential upload",
+        "batch_size": 1,
+        "enable_bucket": True,
+        "bucket_no_upscale": False,
+        "dataset_specs": [
+            {
+                "media_type": "image",
+                "resolution": [512, 512],
+                "num_repeats": 1,
+                "additional_options": "multiple_target = false",
+                "captions": ["first caption", "second caption"],
+                "file_count": 2,
+                "caption_file_count": 0,
+                "control_file_count": 0,
+            }
+        ],
+        "file_tokens": [first_token, second_token],
+        "caption_file_tokens": [],
+        "control_file_tokens": [],
+    }
+
+    response = client.post(
+        f"/api/datasets/managed/upload-sessions/{session_id}/finalize",
+        json=payload,
+    )
+
+    assert response.status_code == 201, response.text
+    created = response.json()
+    managed_dir = paths["data"] / "managed_datasets" / created["id"] / "dataset-1"
+    assert (managed_dir / "media" / "first.png").read_bytes() == b"first image"
+    assert (managed_dir / "media" / "second.png").read_bytes() == b"second image"
+    assert (managed_dir / "media" / "first.txt").read_text(encoding="utf-8") == (
+        "first caption"
+    )
+    assert not (paths["data"] / "managed_uploads" / session_id).exists()
+
+
+def test_staged_upload_update_adds_file_and_cleans_session(client, paths):
+    created = _managed_request(client).json()
+    manifest = client.get(
+        f"/api/datasets/{created['id']}/managed-files"
+    ).json()
+    existing = manifest["datasets"][0]["files"][0]
+    session_id = _staged_session(client)
+    new_token = _stage_file(
+        client, session_id, "second.png", b"second image", "image/png"
+    )
+    payload = {
+        "name": "updated sequential upload",
+        "dataset_specs": [
+            {
+                "media_type": "image",
+                "resolution": [512, 768],
+                "num_repeats": 1,
+                "additional_options": "",
+                "existing_files": [
+                    {"path": existing["path"], "caption": existing["caption"]}
+                ],
+                "existing_control_files": [],
+                "captions": ["second caption"],
+                "file_count": 1,
+                "caption_file_count": 0,
+                "control_file_count": 0,
+            }
+        ],
+        "file_tokens": [new_token],
+    }
+
+    response = client.put(
+        "/api/datasets/managed/upload-sessions/"
+        f"{session_id}/datasets/{created['id']}/finalize",
+        json=payload,
+    )
+
+    assert response.status_code == 200, response.text
+    managed_dir = paths["data"] / "managed_datasets" / created["id"] / "dataset-1"
+    assert (managed_dir / "media" / "sample.png").is_file()
+    assert (managed_dir / "media" / "second.png").read_bytes() == b"second image"
+    assert not (paths["data"] / "managed_uploads" / session_id).exists()
+
+
+def test_staged_upload_update_supports_caption_only_without_new_files(client, paths):
+    created = _managed_request(client).json()
+    manifest = client.get(
+        f"/api/datasets/{created['id']}/managed-files"
+    ).json()
+    existing = manifest["datasets"][0]["files"][0]
+    session_id = _staged_session(client)
+    payload = {
+        "name": created["name"],
+        "dataset_specs": [
+            {
+                "media_type": "image",
+                "resolution": [512, 768],
+                "num_repeats": 1,
+                "additional_options": "",
+                "existing_files": [
+                    {"path": existing["path"], "caption": "caption-only edit"}
+                ],
+                "existing_control_files": [],
+                "captions": [],
+                "file_count": 0,
+                "caption_file_count": 0,
+                "control_file_count": 0,
+            }
+        ],
+    }
+
+    response = client.put(
+        "/api/datasets/managed/upload-sessions/"
+        f"{session_id}/datasets/{created['id']}/finalize",
+        json=payload,
+    )
+
+    assert response.status_code == 200, response.text
+    caption = (
+        paths["data"]
+        / "managed_datasets"
+        / created["id"]
+        / "dataset-1"
+        / "media"
+        / "sample.txt"
+    )
+    assert caption.read_text(encoding="utf-8") == "caption-only edit"
+
+
+def test_staged_upload_finalize_requires_every_token_once(client):
+    session_id = _staged_session(client)
+    token = _stage_file(client, session_id, "sample.png", b"image", "image/png")
+    payload = {
+        "name": "bad staged request",
+        "dataset_specs": [],
+        "file_tokens": [token, token],
+    }
+
+    response = client.post(
+        f"/api/datasets/managed/upload-sessions/{session_id}/finalize",
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert "must not be reused" in response.json()["detail"]
+    assert client.delete(
+        f"/api/datasets/managed/upload-sessions/{session_id}"
+    ).status_code == 204
+
+
+def test_abandoned_staged_uploads_are_removed_on_restart(make_client, paths):
+    with make_client() as first_client:
+        session_id = _staged_session(first_client)
+        _stage_file(first_client, session_id, "sample.png", b"image", "image/png")
+        assert (paths["data"] / "managed_uploads" / session_id).is_dir()
+
+    with make_client():
+        assert list((paths["data"] / "managed_uploads").iterdir()) == []
+
+
 def test_create_managed_image_dataset_writes_media_captions_and_export(client, paths):
     response = _managed_request(
         client,
@@ -167,6 +446,9 @@ def test_create_managed_image_dataset_writes_media_captions_and_export(client, p
     assert created["general"] == {
         "resolution": [512, 768],
         "caption_extension": ".txt",
+        "batch_size": 1,
+        "enable_bucket": True,
+        "bucket_no_upscale": False,
     }
 
     managed_dir = paths["data"] / "managed_datasets" / created["id"]
@@ -801,6 +1083,7 @@ def test_edit_managed_dataset_adds_removes_and_updates_owned_files(client, paths
         "media_type": "image",
         "resolution": [640, 640],
         "num_repeats": 7,
+        "additional_options": "multiple_target = true",
         "existing_files": [
             {
                 "path": image_manifest["files"][0]["path"],
@@ -819,6 +1102,9 @@ def test_edit_managed_dataset_adds_removes_and_updates_owned_files(client, paths
             "name": "edited multi dataset",
             "description": "updated files",
             "dataset_specs": json.dumps([spec]),
+            "batch_size": "3",
+            "enable_bucket": "false",
+            "bucket_no_upscale": "true",
         },
         files=[
             ("files", ("new.png", io.BytesIO(b"new image"), "image/png")),
@@ -833,9 +1119,16 @@ def test_edit_managed_dataset_adds_removes_and_updates_owned_files(client, paths
     updated = response.json()
     assert updated["name"] == "edited multi dataset"
     assert updated["description"] == "updated files"
+    assert updated["general"] == {
+        "caption_extension": ".txt",
+        "batch_size": 3,
+        "enable_bucket": False,
+        "bucket_no_upscale": True,
+    }
     assert len(updated["datasets"]) == 1
     assert updated["datasets"][0]["resolution"] == [640, 640]
     assert updated["datasets"][0]["num_repeats"] == 7
+    assert updated["datasets"][0]["multiple_target"] is True
     assert (managed_dir / "dataset-1" / "media" / "still.png").read_bytes() == b"image"
     assert (managed_dir / "dataset-1" / "media" / "still.txt").read_text(
         encoding="utf-8"

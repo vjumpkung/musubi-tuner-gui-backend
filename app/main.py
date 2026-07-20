@@ -47,6 +47,10 @@ class ManagedUploadBodyLimitMiddleware:
             method == "POST"
             and path in {"/api/datasets/managed", "/api/datasets/managed/batch"}
         ) or (
+            method == "POST"
+            and path.startswith("/api/datasets/managed/upload-sessions/")
+            and path.endswith("/files")
+        ) or (
             method == "PUT"
             and path.startswith("/api/datasets/")
             and path.endswith("/managed")
@@ -99,6 +103,8 @@ async def lifespan(app: FastAPI):
     settings.data_root.mkdir(parents=True, exist_ok=True)
     settings.jobs_dir.mkdir(parents=True, exist_ok=True)
     settings.managed_datasets_dir.mkdir(parents=True, exist_ok=True)
+    settings.managed_uploads_dir.mkdir(parents=True, exist_ok=True)
+    datasets.cleanup_staged_uploads(settings.managed_uploads_dir)
 
     db = await Database.open(settings.database_path)
     await datasets.reconcile_managed_storage(db, settings.managed_datasets_dir)
@@ -113,6 +119,7 @@ async def lifespan(app: FastAPI):
     app.state.runner = runner
     app.state.downloads = DownloadManager(settings)
     app.state.managed_storage_lock = asyncio.Lock()
+    app.state.managed_upload_lock = asyncio.Lock()
 
     try:
         yield

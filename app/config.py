@@ -93,6 +93,10 @@ class Settings:
     def managed_datasets_dir(self) -> Path:
         return self.data_root / "managed_datasets"
 
+    @property
+    def managed_uploads_dir(self) -> Path:
+        return self.data_root / "managed_uploads"
+
     def resolve_inside_workspace(self, raw: str) -> Path:
         """Resolve a client-supplied path against the workspace root.
 

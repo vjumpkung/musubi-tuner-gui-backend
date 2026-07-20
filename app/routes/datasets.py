@@ -13,10 +13,11 @@ from pathlib import Path
 import aiosqlite
 import tomli_w
 from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile
+from starlette.datastructures import Headers
 
 from ..config import Settings
 from ..db import Database, utc_now
-from ..schemas.datasets import DatasetPayload
+from ..schemas.datasets import DatasetPayload, ManagedFinalizePayload
 from ..utils.dataset_rules import (
     JSONL_SOURCE_KEYS,
     SOURCE_KEYS,
@@ -29,8 +30,22 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".avi", ".mov", ".mkv"}
 CAPTION_EXTENSION = ".txt"
 MAX_CAPTION_FILE_BYTES = 1024 * 1024
+MAX_MANAGED_OPTIONS_BYTES = 64 * 1024
+STAGED_DATA_SUFFIX = ".data"
+STAGED_METADATA_SUFFIX = ".json"
 STALE_MANAGED_PREFIXES = (".orphan-", ".pending-delete-", ".tombstone-")
 EDIT_MANAGED_PREFIXES = (".edit-backup-", ".edit-")
+MANAGED_DATASET_OWNED_KEYS = set(SOURCE_KEYS) | {
+    "cache_directory",
+    "caption_extension",
+    "control_directory",
+    "resolution",
+    "num_repeats",
+    "target_frames",
+    "batch_size",
+    "enable_bucket",
+    "bucket_no_upscale",
+}
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
 
@@ -87,6 +102,17 @@ def _remove_managed_entry(entry: Path) -> None:
         entry.unlink()
     else:
         shutil.rmtree(entry)
+
+
+def cleanup_staged_uploads(root: Path) -> None:
+    """Remove incomplete browser upload sessions during application startup."""
+    resolved_root = root.resolve()
+    if not resolved_root.is_dir():
+        return
+    for entry in resolved_root.iterdir():
+        if entry.parent.resolve() != resolved_root:
+            raise OSError("Staged upload cleanup escaped its storage root")
+        _remove_managed_entry(entry)
 
 
 def _managed_directory_matches_config(directory: Path, config: dict) -> bool:
@@ -185,6 +211,113 @@ def _managed_storage_bytes(root: Path) -> int:
     return total
 
 
+def _uuid_value(raw: str, label: str) -> str:
+    try:
+        return str(uuid.UUID(raw))
+    except (ValueError, AttributeError) as error:
+        raise HTTPException(status_code=404, detail=f"Unknown {label}") from error
+
+
+def _staged_session_directory(settings: Settings, session_id: str) -> Path:
+    canonical_id = _uuid_value(session_id, "upload session")
+    root = settings.managed_uploads_dir.resolve()
+    candidate = (root / canonical_id).resolve()
+    if candidate.parent != root or not candidate.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown upload session")
+    return candidate
+
+
+def _staged_token_paths(directory: Path, token: str) -> tuple[Path, Path]:
+    canonical_token = _uuid_value(token, "staged upload")
+    return (
+        directory / f"{canonical_token}{STAGED_DATA_SUFFIX}",
+        directory / f"{canonical_token}{STAGED_METADATA_SUFFIX}",
+    )
+
+
+def _available_staged_tokens(directory: Path) -> set[str]:
+    tokens: set[str] = set()
+    for metadata_path in directory.glob(f"*{STAGED_METADATA_SUFFIX}"):
+        token = metadata_path.name.removesuffix(STAGED_METADATA_SUFFIX)
+        data_path = directory / f"{token}{STAGED_DATA_SUFFIX}"
+        if data_path.is_file():
+            tokens.add(token)
+    return tokens
+
+
+def _open_staged_uploads(directory: Path, tokens: list[str]) -> list[UploadFile]:
+    uploads: list[UploadFile] = []
+    try:
+        for token in tokens:
+            data_path, metadata_path = _staged_token_paths(directory, token)
+            if not data_path.is_file() or not metadata_path.is_file():
+                raise HTTPException(status_code=422, detail="Unknown staged upload token")
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise HTTPException(
+                    status_code=500, detail="Staged upload metadata is unavailable"
+                ) from error
+            filename = metadata.get("filename")
+            content_type = metadata.get("content_type")
+            if not isinstance(filename, str) or not isinstance(content_type, str):
+                raise HTTPException(
+                    status_code=500, detail="Staged upload metadata is invalid"
+                )
+            uploads.append(
+                UploadFile(
+                    file=data_path.open("rb"),
+                    size=data_path.stat().st_size,
+                    filename=filename,
+                    headers=Headers({"content-type": content_type}),
+                )
+            )
+        return uploads
+    except BaseException:
+        for upload in uploads:
+            upload.file.close()
+        raise
+
+
+async def _claim_staged_uploads(
+    request: Request, session_id: str, token_groups: list[list[str]]
+) -> tuple[Path, list[list[UploadFile]]]:
+    settings = request.app.state.settings
+    async with request.app.state.managed_upload_lock:
+        directory = _staged_session_directory(settings, session_id)
+        tokens = [token for group in token_groups for token in group]
+        canonical_tokens = [_uuid_value(token, "staged upload") for token in tokens]
+        if len(canonical_tokens) != len(set(canonical_tokens)):
+            raise HTTPException(
+                status_code=422, detail="Staged upload tokens must not be reused"
+            )
+        if set(canonical_tokens) != _available_staged_tokens(directory):
+            raise HTTPException(
+                status_code=422,
+                detail="Finalize request must reference every staged upload exactly once",
+            )
+        claimed_directory = directory.with_name(
+            f".finalizing-{directory.name}-{uuid.uuid4()}"
+        )
+        directory.rename(claimed_directory)
+
+    uploads: list[list[UploadFile]] = []
+    offset = 0
+    try:
+        for group in token_groups:
+            group_tokens = canonical_tokens[offset : offset + len(group)]
+            uploads.append(_open_staged_uploads(claimed_directory, group_tokens))
+            offset += len(group)
+        return claimed_directory, uploads
+    except BaseException:
+        for group in uploads:
+            for upload in group:
+                upload.file.close()
+        if claimed_directory.exists():
+            _remove_managed_entry(claimed_directory)
+        raise
+
+
 def _cleanup_failed_managed_creation(root: Path, directory: Path) -> None:
     if not directory.exists():
         return
@@ -216,6 +349,72 @@ def _positive_int(value: object) -> bool:
 
 def _non_negative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _managed_general_config(
+    batch_size: int, enable_bucket: bool, bucket_no_upscale: bool
+) -> dict:
+    if not _positive_int(batch_size):
+        raise HTTPException(
+            status_code=422, detail="batch_size must be a positive integer"
+        )
+    return {
+        "caption_extension": CAPTION_EXTENSION,
+        "batch_size": batch_size,
+        "enable_bucket": enable_bucket,
+        "bucket_no_upscale": bucket_no_upscale,
+    }
+
+
+def _has_nested_table(value: object) -> bool:
+    if isinstance(value, dict):
+        return True
+    return isinstance(value, list) and any(_has_nested_table(item) for item in value)
+
+
+def _managed_additional_options(spec: dict, label: str) -> dict:
+    """Parse a TOML key/value fragment without allowing managed fields to be replaced."""
+    raw = spec.get("additional_options", "")
+    if not isinstance(raw, str):
+        raise HTTPException(
+            status_code=422, detail=f"{label}.additional_options must be TOML text"
+        )
+    if len(raw.encode("utf-8")) > MAX_MANAGED_OPTIONS_BYTES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{label}.additional_options must not exceed "
+                f"{MAX_MANAGED_OPTIONS_BYTES} bytes"
+            ),
+        )
+    try:
+        document = tomllib.loads(f"[options]\n{raw}")
+    except tomllib.TOMLDecodeError as error:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.additional_options is invalid TOML: {error}",
+        ) from error
+    if set(document) != {"options"}:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.additional_options may contain only key/value options",
+        )
+    options = document["options"]
+    if any(_has_nested_table(value) for value in options.values()):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}.additional_options may not contain tables or inline tables",
+        )
+    protected = sorted(MANAGED_DATASET_OWNED_KEYS.intersection(options))
+    if protected:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{label}.additional_options cannot replace managed option(s): "
+                f"{', '.join(protected)}"
+            ),
+        )
+    return options
 
 
 def _upload_basename(filename: str | None) -> str:
@@ -462,6 +661,8 @@ async def _prepare_managed_batch_dataset(
             detail=f"{label}.num_repeats must be a positive integer",
         )
 
+    additional_options = _managed_additional_options(spec, label)
+
     captions = spec.get("captions")
     if captions is None:
         parsed_captions = [""] * len(files)
@@ -542,6 +743,7 @@ async def _prepare_managed_batch_dataset(
         "resolution": resolution,
         "num_repeats": num_repeats,
         "target_frames": target_frames,
+        "additional_options": additional_options,
         "files": files,
         "captions": parsed_captions,
         "control_files": control_files,
@@ -594,6 +796,189 @@ async def _write_managed_upload(
 
 def _db(request: Request) -> Database:
     return request.app.state.db
+
+
+@router.post("/managed/upload-sessions", status_code=201)
+async def create_managed_upload_session(request: Request) -> dict:
+    settings = request.app.state.settings
+    session_id = str(uuid.uuid4())
+    directory = settings.managed_uploads_dir / session_id
+    async with request.app.state.managed_upload_lock:
+        directory.mkdir(exist_ok=False)
+    return {"id": session_id}
+
+
+@router.post("/managed/upload-sessions/{session_id}/files", status_code=201)
+async def upload_managed_session_file(
+    session_id: str, request: Request, file: UploadFile = File(...)
+) -> dict:
+    settings = request.app.state.settings
+    filename = _upload_basename(file.filename)
+    token = str(uuid.uuid4())
+    data_path: Path | None = None
+    metadata_path: Path | None = None
+    partial_path: Path | None = None
+    try:
+        async with request.app.state.managed_upload_lock:
+            directory = _staged_session_directory(settings, session_id)
+            if len(_available_staged_tokens(directory)) >= settings.managed_max_files:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "A managed dataset upload may contain at most "
+                        f"{settings.managed_max_files} files"
+                    ),
+                )
+
+            session_bytes = _managed_storage_bytes(directory)
+            staged_bytes = _managed_storage_bytes(settings.managed_uploads_dir)
+            managed_bytes = _managed_storage_bytes(settings.managed_datasets_dir)
+            data_path, metadata_path = _staged_token_paths(directory, token)
+            partial_path = directory / f".{token}.part"
+            file_bytes = 0
+            with partial_path.open("xb") as output:
+                while chunk := await file.read(1024 * 1024):
+                    file_bytes += len(chunk)
+                    if file_bytes > settings.managed_max_file_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                f"Uploaded file '{filename}' exceeds the "
+                                f"{settings.managed_max_file_bytes}-byte limit"
+                            ),
+                        )
+                    if session_bytes + file_bytes > settings.managed_max_total_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                "Managed dataset uploads exceed the "
+                                f"{settings.managed_max_total_bytes}-byte total limit"
+                            ),
+                        )
+                    if (
+                        managed_bytes + staged_bytes + file_bytes
+                        > settings.managed_max_storage_bytes
+                    ):
+                        raise HTTPException(
+                            status_code=413,
+                            detail="Managed dataset storage quota would be exceeded",
+                        )
+                    output.write(chunk)
+            partial_path.rename(data_path)
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "filename": filename,
+                        "content_type": file.content_type
+                        or "application/octet-stream",
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return {"token": token, "filename": filename, "size_bytes": file_bytes}
+    except BaseException:
+        for path in (partial_path, data_path, metadata_path):
+            if path is not None and path.exists():
+                path.unlink()
+        raise
+    finally:
+        await file.close()
+
+
+@router.delete("/managed/upload-sessions/{session_id}", status_code=204)
+async def delete_managed_upload_session(session_id: str, request: Request) -> Response:
+    settings = request.app.state.settings
+    async with request.app.state.managed_upload_lock:
+        directory = _staged_session_directory(settings, session_id)
+        _remove_managed_entry(directory)
+    return Response(status_code=204)
+
+
+async def _close_staged_groups(groups: list[list[UploadFile]]) -> None:
+    for group in groups:
+        for upload in group:
+            await upload.close()
+
+
+def _discard_claimed_upload(directory: Path) -> None:
+    if not directory.exists():
+        return
+    try:
+        _remove_managed_entry(directory)
+    except OSError:
+        # The startup cleanup retries this without turning an already-committed
+        # dataset into an apparent finalize failure.
+        pass
+
+
+@router.post("/managed/upload-sessions/{session_id}/finalize", status_code=201)
+async def finalize_managed_upload_session(
+    session_id: str, payload: ManagedFinalizePayload, request: Request
+) -> dict:
+    claimed_directory, groups = await _claim_staged_uploads(
+        request,
+        session_id,
+        [
+            payload.file_tokens,
+            payload.caption_file_tokens,
+            payload.control_file_tokens,
+        ],
+    )
+    files, caption_files, control_files = groups
+    try:
+        return await create_managed_dataset_batch(
+            request=request,
+            name=payload.name,
+            dataset_specs=json.dumps(payload.dataset_specs),
+            files=files,
+            description=payload.description,
+            caption_files=caption_files,
+            control_files=control_files,
+            batch_size=payload.batch_size,
+            enable_bucket=payload.enable_bucket,
+            bucket_no_upscale=payload.bucket_no_upscale,
+        )
+    finally:
+        await _close_staged_groups(groups)
+        _discard_claimed_upload(claimed_directory)
+
+
+@router.put(
+    "/managed/upload-sessions/{session_id}/datasets/{config_id}/finalize"
+)
+async def finalize_managed_update_session(
+    session_id: str,
+    config_id: str,
+    payload: ManagedFinalizePayload,
+    request: Request,
+) -> dict:
+    claimed_directory, groups = await _claim_staged_uploads(
+        request,
+        session_id,
+        [
+            payload.file_tokens,
+            payload.caption_file_tokens,
+            payload.control_file_tokens,
+        ],
+    )
+    files, caption_files, control_files = groups
+    try:
+        return await update_managed_dataset_files(
+            config_id=config_id,
+            request=request,
+            name=payload.name,
+            dataset_specs=json.dumps(payload.dataset_specs),
+            description=payload.description,
+            files=files,
+            caption_files=caption_files,
+            control_files=control_files,
+            batch_size=payload.batch_size,
+            enable_bucket=payload.enable_bucket,
+            bucket_no_upscale=payload.bucket_no_upscale,
+        )
+    finally:
+        await _close_staged_groups(groups)
+        _discard_claimed_upload(claimed_directory)
 
 
 def _resource(row) -> dict:
@@ -845,6 +1230,7 @@ async def _prepare_managed_update_dataset(
             status_code=422,
             detail=f"{label}.num_repeats must be a positive integer",
         )
+    additional_options = _managed_additional_options(spec, label)
     target_frames = spec.get("target_frames")
     if target_frames is not None and (
         not isinstance(target_frames, list)
@@ -989,6 +1375,7 @@ async def _prepare_managed_update_dataset(
         "resolution": resolution,
         "num_repeats": num_repeats,
         "target_frames": target_frames,
+        "additional_options": additional_options,
         "existing_files": existing_files,
         "files": files,
         "captions": [caption.strip() for caption in parsed_captions],
@@ -1049,6 +1436,9 @@ async def create_managed_dataset(
     target_frames: str | None = Form(None),
     caption_files: list[UploadFile] | None = File(None),
     control_files: list[UploadFile] | None = File(None),
+    batch_size: int = Form(1),
+    enable_bucket: bool = Form(True),
+    bucket_no_upscale: bool = Form(False),
 ) -> dict:
     """Upload captioned media and create a config pointing at managed storage."""
     db = _db(request)
@@ -1184,7 +1574,12 @@ async def create_managed_dataset(
             }
         )
     config = normalize_config(
-        {"resolution": parsed_resolution, "caption_extension": ".txt"},
+        {
+            "resolution": parsed_resolution,
+            **_managed_general_config(
+                batch_size, enable_bucket, bucket_no_upscale
+            ),
+        },
         [dataset],
     )
     warnings = _validate_or_422(config["general"], config["datasets"])
@@ -1350,6 +1745,9 @@ async def create_managed_dataset_batch(
     description: str | None = Form(None),
     caption_files: list[UploadFile] | None = File(None),
     control_files: list[UploadFile] | None = File(None),
+    batch_size: int = Form(1),
+    enable_bucket: bool = Form(True),
+    bucket_no_upscale: bool = Form(False),
 ) -> dict:
     """Upload one or more datasets into one managed TOML configuration."""
     db = _db(request)
@@ -1473,6 +1871,7 @@ async def create_managed_dataset_batch(
                 "image_directory" if media_type == "image" else "video_directory"
             )
             dataset = {
+                **prepared["additional_options"],
                 source_key: str(media_directory.resolve()),
                 "cache_directory": str(cache_directory.resolve()),
                 "resolution": prepared["resolution"],
@@ -1481,15 +1880,16 @@ async def create_managed_dataset_batch(
             if prepared["control_files"]:
                 dataset["control_directory"] = str(control_directory.resolve())
             if media_type == "video":
-                dataset.update(
-                    {
-                        "target_frames": prepared["target_frames"],
-                        "frame_extraction": "head",
-                    }
-                )
+                dataset["target_frames"] = prepared["target_frames"]
+                dataset.setdefault("frame_extraction", "head")
             datasets.append(dataset)
 
-        config = normalize_config({"caption_extension": ".txt"}, datasets)
+        config = normalize_config(
+            _managed_general_config(
+                batch_size, enable_bucket, bucket_no_upscale
+            ),
+            datasets,
+        )
         warnings = _validate_or_422(config["general"], config["datasets"])
         config_toml = render_toml(config)
         fixed_bytes = len(config_toml.encode("utf-8")) + sum(
@@ -1690,6 +2090,9 @@ async def update_managed_dataset_files(
     files: list[UploadFile] | None = File(None),
     caption_files: list[UploadFile] | None = File(None),
     control_files: list[UploadFile] | None = File(None),
+    batch_size: int = Form(1),
+    enable_bucket: bool = Form(True),
+    bucket_no_upscale: bool = Form(False),
 ) -> dict:
     """Replace a managed config while retaining selected owned files."""
     db = _db(request)
@@ -1840,6 +2243,7 @@ async def update_managed_dataset_files(
                 else "video_directory"
             )
             dataset = {
+                **prepared["additional_options"],
                 source_key: str(final_media_directory.resolve()),
                 "cache_directory": str(final_cache_directory.resolve()),
                 "resolution": prepared["resolution"],
@@ -1848,15 +2252,16 @@ async def update_managed_dataset_files(
             if prepared["existing_controls"] or prepared["control_files"]:
                 dataset["control_directory"] = str(final_control_directory.resolve())
             if prepared["media_type"] == "video":
-                dataset.update(
-                    {
-                        "target_frames": prepared["target_frames"],
-                        "frame_extraction": "head",
-                    }
-                )
+                dataset["target_frames"] = prepared["target_frames"]
+                dataset.setdefault("frame_extraction", "head")
             datasets.append(dataset)
 
-        config = normalize_config({"caption_extension": ".txt"}, datasets)
+        config = normalize_config(
+            _managed_general_config(
+                batch_size, enable_bucket, bucket_no_upscale
+            ),
+            datasets,
+        )
         warnings = _validate_or_422(config["general"], config["datasets"])
         config_toml = render_toml(config)
         caption_bytes = sum(
