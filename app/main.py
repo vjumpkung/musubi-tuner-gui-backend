@@ -22,11 +22,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import datasets, downloads, system_monitor, training
 from .config import load_settings
 from .db import Database
-from .downloads import DownloadManager
-from .queue_runner import QueueRunner, recover_interrupted_jobs
+from .routes import datasets, downloads, system_monitor, training
+from .services.downloads import DownloadManager
+from .services.queue_runner import QueueRunner, recover_interrupted_jobs
 
 
 class _ManagedBodyTooLarge(OSError):
@@ -123,7 +123,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         if runner.current_process is not None:
-            from .process import terminate_tree
+            from .utils.process import terminate_tree
 
             await terminate_tree(runner.current_process)
         await app.state.downloads.shutdown()

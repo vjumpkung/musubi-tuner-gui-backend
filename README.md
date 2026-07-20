@@ -9,6 +9,17 @@ FastAPI backend for the musubi-tuner GUI. Implements the contract in
 - **Training job queue** — executes training jobs one at a time through a FIFO queue.
 - **System monitor** — reports host CPU/RAM and NVIDIA GPU/VRAM utilization.
 
+## Architecture
+
+- `app/routes/` contains the FastAPI endpoint modules.
+- `app/schemas/` contains Pydantic request models.
+- `app/services/` contains background and stateful application services.
+- `app/utils/` contains stateless validation, command, and process helpers.
+- `app/main.py` wires the routers and service lifecycles together.
+
+The original flat module paths remain as compatibility aliases; new imports should use the
+responsibility-based packages above.
+
 ## Setup
 
 ```bash

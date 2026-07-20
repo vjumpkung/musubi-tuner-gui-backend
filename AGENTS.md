@@ -2,13 +2,21 @@
 
 ## Project Structure & Module Organization
 
-This is a Python 3.12 FastAPI backend managed with `uv`. Application code lives in `app/`.
-`app/main.py` creates the FastAPI application and owns its lifespan. API routers are grouped by
-feature in `downloads.py`, `datasets.py`, and `training.py`. Queue execution lives in
-`queue_runner.py`; subprocess construction and lifecycle handling live in `command_builder.py` and
-`process.py`. SQLite access is centralized in `db.py`, while environment-based configuration and
-workspace path confinement live in `config.py`. Tests live in `tests/` and mirror the main backend
-features.
+This is a Python 3.12 FastAPI backend managed with `uv`. Application code lives in `app/` and is
+organized by responsibility:
+
+- `app/routes/` owns FastAPI routers, HTTP request parsing, status codes, and response construction.
+- `app/schemas/` owns Pydantic request models. Use `Field(default_factory=...)` for mutable defaults.
+- `app/services/` owns stateful application behavior and background orchestration, including model
+  downloads, the training queue, and system resource collection.
+- `app/utils/` owns stateless validation, command-building, and subprocess helpers.
+- `app/main.py` creates the application and owns its lifespan; `config.py`, `db.py`, and
+  `profiles.py` remain shared foundational/domain modules.
+
+The modules at legacy paths such as `app/downloads.py`, `app/training.py`, and
+`app/command_builder.py` are compatibility aliases for existing integrations and tests. Do not add
+new behavior to those aliases. New code should import from the canonical `routes`, `schemas`,
+`services`, or `utils` module. Tests live in `tests/` and mirror the main backend features.
 
 The built frontend may be written to `web/` and served by FastAPI in production. Treat `web/`,
 `data/`, local databases, job logs, and dataset snapshots as generated runtime content rather than
@@ -32,6 +40,11 @@ Prefer FastAPI dependency/request state patterns already used in the routers. Ke
 serialized through the existing write locks and commit or roll back atomically. Return plain,
 JSON-serializable response objects and use `HTTPException` with clear `detail` messages for expected
 client errors.
+
+Keep route functions thin when adding features: validate HTTP input with a schema, delegate reusable
+or stateful work to a service, and place pure reusable logic in a utility module. Services must not
+import routers. Avoid circular feature imports; shared request models belong in `schemas/` and shared
+pure behavior belongs in `utils/`.
 
 Keep API routes under `/api`. Preserve existing status-code semantics: `201` for created dataset
 configs, `202` for accepted background work, and `204` for successful deletions without a body.
