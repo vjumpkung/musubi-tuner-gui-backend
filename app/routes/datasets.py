@@ -33,6 +33,7 @@ MAX_CAPTION_FILE_BYTES = 1024 * 1024
 MAX_MANAGED_OPTIONS_BYTES = 64 * 1024
 STAGED_DATA_SUFFIX = ".data"
 STAGED_METADATA_SUFFIX = ".json"
+STAGED_FILE_KINDS = ("target", "caption", "control")
 STALE_MANAGED_PREFIXES = (".orphan-", ".pending-delete-", ".tombstone-")
 EDIT_MANAGED_PREFIXES = (".edit-backup-", ".edit-")
 MANAGED_DATASET_OWNED_KEYS = set(SOURCE_KEYS) | {
@@ -245,13 +246,17 @@ def _available_staged_tokens(directory: Path) -> set[str]:
     return tokens
 
 
-def _open_staged_uploads(directory: Path, tokens: list[str]) -> list[UploadFile]:
+def _open_staged_uploads(
+    directory: Path, tokens: list[str], expected_kind: str
+) -> list[UploadFile]:
     uploads: list[UploadFile] = []
     try:
         for token in tokens:
             data_path, metadata_path = _staged_token_paths(directory, token)
             if not data_path.is_file() or not metadata_path.is_file():
-                raise HTTPException(status_code=422, detail="Unknown staged upload token")
+                raise HTTPException(
+                    status_code=422, detail="Unknown staged upload token"
+                )
             try:
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -260,9 +265,22 @@ def _open_staged_uploads(directory: Path, tokens: list[str]) -> list[UploadFile]
                 ) from error
             filename = metadata.get("filename")
             content_type = metadata.get("content_type")
-            if not isinstance(filename, str) or not isinstance(content_type, str):
+            kind = metadata.get("kind")
+            if (
+                not isinstance(filename, str)
+                or not isinstance(content_type, str)
+                or kind not in STAGED_FILE_KINDS
+            ):
                 raise HTTPException(
                     status_code=500, detail="Staged upload metadata is invalid"
+                )
+            if kind != expected_kind:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Staged file '{filename}' is a {kind} file, not a "
+                        f"{expected_kind} file"
+                    ),
                 )
             uploads.append(
                 UploadFile(
@@ -282,6 +300,8 @@ def _open_staged_uploads(directory: Path, tokens: list[str]) -> list[UploadFile]
 async def _claim_staged_uploads(
     request: Request, session_id: str, token_groups: list[list[str]]
 ) -> tuple[Path, list[list[UploadFile]]]:
+    if len(token_groups) != len(STAGED_FILE_KINDS):
+        raise RuntimeError("Staged uploads require target, caption, and control groups")
     settings = request.app.state.settings
     async with request.app.state.managed_upload_lock:
         directory = _staged_session_directory(settings, session_id)
@@ -304,9 +324,11 @@ async def _claim_staged_uploads(
     uploads: list[list[UploadFile]] = []
     offset = 0
     try:
-        for group in token_groups:
+        for expected_kind, group in zip(STAGED_FILE_KINDS, token_groups, strict=True):
             group_tokens = canonical_tokens[offset : offset + len(group)]
-            uploads.append(_open_staged_uploads(claimed_directory, group_tokens))
+            uploads.append(
+                _open_staged_uploads(claimed_directory, group_tokens, expected_kind)
+            )
             offset += len(group)
         return claimed_directory, uploads
     except BaseException:
@@ -810,7 +832,10 @@ async def create_managed_upload_session(request: Request) -> dict:
 
 @router.post("/managed/upload-sessions/{session_id}/files", status_code=201)
 async def upload_managed_session_file(
-    session_id: str, request: Request, file: UploadFile = File(...)
+    session_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    kind: str = Form(...),
 ) -> dict:
     settings = request.app.state.settings
     filename = _upload_basename(file.filename)
@@ -819,6 +844,11 @@ async def upload_managed_session_file(
     metadata_path: Path | None = None
     partial_path: Path | None = None
     try:
+        if kind not in STAGED_FILE_KINDS:
+            raise HTTPException(
+                status_code=422,
+                detail="kind must be 'target', 'caption', or 'control'",
+            )
         async with request.app.state.managed_upload_lock:
             directory = _staged_session_directory(settings, session_id)
             if len(_available_staged_tokens(directory)) >= settings.managed_max_files:
@@ -869,13 +899,18 @@ async def upload_managed_session_file(
                 json.dumps(
                     {
                         "filename": filename,
-                        "content_type": file.content_type
-                        or "application/octet-stream",
+                        "content_type": file.content_type or "application/octet-stream",
+                        "kind": kind,
                     }
                 ),
                 encoding="utf-8",
             )
-        return {"token": token, "filename": filename, "size_bytes": file_bytes}
+        return {
+            "token": token,
+            "filename": filename,
+            "size_bytes": file_bytes,
+            "kind": kind,
+        }
     except BaseException:
         for path in (partial_path, data_path, metadata_path):
             if path is not None and path.exists():

@@ -100,9 +100,10 @@ def _staged_session(client):
     return response.json()["id"]
 
 
-def _stage_file(client, session_id, filename, content, content_type):
+def _stage_file(client, session_id, filename, content, content_type, kind="target"):
     response = client.post(
         f"/api/datasets/managed/upload-sessions/{session_id}/files",
+        data={"kind": kind},
         files={"file": (filename, io.BytesIO(content), content_type)},
     )
     assert response.status_code == 201, response.text
@@ -308,6 +309,146 @@ def test_staged_uploads_finalize_sequential_files(client, paths):
         "first caption"
     )
     assert not (paths["data"] / "managed_uploads" / session_id).exists()
+
+
+def test_staged_upload_requires_a_valid_file_kind(client):
+    session_id = _staged_session(client)
+
+    response = client.post(
+        f"/api/datasets/managed/upload-sessions/{session_id}/files",
+        data={"kind": "other"},
+        files={"file": ("sample.png", io.BytesIO(b"image"), "image/png")},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "kind must be 'target', 'caption', or 'control'"
+
+
+def test_staged_finalize_rejects_a_token_in_the_wrong_file_group(client):
+    session_id = _staged_session(client)
+    token = _stage_file(client, session_id, "sample.png", b"image", "image/png")
+    payload = {
+        "name": "mixed staged groups",
+        "dataset_specs": [],
+        "file_tokens": [],
+        "caption_file_tokens": [],
+        "control_file_tokens": [token],
+    }
+
+    response = client.post(
+        f"/api/datasets/managed/upload-sessions/{session_id}/finalize",
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "Staged file 'sample.png' is a target file, not a control file"
+    )
+
+
+def test_staged_finalize_preserves_target_inline_caption_and_control(client, paths):
+    session_id = _staged_session(client)
+    media_token = _stage_file(client, session_id, "sample.jpg", b"target", "image/jpeg")
+    control_token = _stage_file(
+        client, session_id, "sample.png", b"control", "image/png", "control"
+    )
+    payload = {
+        "name": "staged inline caption and control",
+        "dataset_specs": [
+            {
+                "media_type": "image",
+                "resolution": [512, 512],
+                "num_repeats": 1,
+                "additional_options": "",
+                "captions": ["inline caption"],
+                "file_count": 1,
+                "caption_file_count": 0,
+                "control_file_count": 1,
+            }
+        ],
+        "file_tokens": [media_token],
+        "caption_file_tokens": [],
+        "control_file_tokens": [control_token],
+    }
+
+    response = client.post(
+        f"/api/datasets/managed/upload-sessions/{session_id}/finalize",
+        json=payload,
+    )
+
+    assert response.status_code == 201, response.text
+    managed_dir = (
+        paths["data"] / "managed_datasets" / response.json()["id"] / "dataset-1"
+    )
+    assert (managed_dir / "media" / "sample.jpg").read_bytes() == b"target"
+    assert (managed_dir / "media" / "sample.txt").read_text(
+        encoding="utf-8"
+    ) == "inline caption"
+    assert (managed_dir / "control" / "sample.png").read_bytes() == b"control"
+
+
+@pytest.mark.parametrize(
+    ("control_names", "expected_control_names"),
+    [
+        (("1.jpg",), ("1.jpg",)),
+        (
+            ("1_0.jpg", "1_1.jpg", "1_2.jpg"),
+            ("1_0.jpg", "1_1.jpg", "1_2.jpg"),
+        ),
+    ],
+)
+def test_staged_finalize_pairs_single_or_numbered_controls(
+    client, paths, control_names, expected_control_names
+):
+    session_id = _staged_session(client)
+    media_token = _stage_file(client, session_id, "1.jpg", b"target", "image/jpeg")
+    caption_token = _stage_file(
+        client, session_id, "1.txt", b"caption", "text/plain", "caption"
+    )
+    control_tokens = [
+        _stage_file(
+            client,
+            session_id,
+            control_name,
+            f"control {index}".encode(),
+            "image/jpeg",
+            "control",
+        )
+        for index, control_name in enumerate(control_names)
+    ]
+    payload = {
+        "name": f"staged controls {len(control_names)}",
+        "dataset_specs": [
+            {
+                "media_type": "image",
+                "resolution": [512, 512],
+                "num_repeats": 1,
+                "additional_options": "",
+                "captions": [""],
+                "file_count": 1,
+                "caption_file_count": 1,
+                "control_file_count": len(control_names),
+            }
+        ],
+        "file_tokens": [media_token],
+        "caption_file_tokens": [caption_token],
+        "control_file_tokens": control_tokens,
+    }
+
+    response = client.post(
+        f"/api/datasets/managed/upload-sessions/{session_id}/finalize",
+        json=payload,
+    )
+
+    assert response.status_code == 201, response.text
+    managed_dir = (
+        paths["data"] / "managed_datasets" / response.json()["id"] / "dataset-1"
+    )
+    assert (managed_dir / "media" / "1.jpg").read_bytes() == b"target"
+    assert (managed_dir / "media" / "1.txt").read_text(encoding="utf-8") == "caption"
+    assert sorted(path.name for path in (managed_dir / "control").iterdir()) == list(
+        expected_control_names
+    )
 
 
 def test_staged_upload_update_adds_file_and_cleans_session(client, paths):
