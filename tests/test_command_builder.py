@@ -135,6 +135,31 @@ def test_validate_values_requires_profile_fields():
     )
 
 
+def test_flux2_model_versions_match_download_bundles():
+    profile = TRAINING_PROFILES["flux-2"]
+    assert profile.selectors[0].options == (
+        "dev",
+        "klein-base-4b",
+        "klein-base-9b",
+    )
+
+    values = {
+        "musubiPath": "./musubi-tuner",
+        "dit": "./diffusion_models/flux-2-klein-base-4b.safetensors",
+        "vae": "./vae/ae.safetensors",
+        "textEncoder": (
+            "./text_encoders/qwen3_4b/model-00001-of-00002.safetensors"
+        ),
+        "outputName": "flux2_lora",
+        "outputDir": "./lora_training/outputs",
+    }
+    for model_version in profile.selectors[0].options:
+        validate_values(profile, {**values, "modelVersion": model_version})
+
+    with pytest.raises(ValuesError, match="modelVersion"):
+        validate_values(profile, {**values, "modelVersion": "klein-4b"})
+
+
 def test_extra_args_tokens_are_validated():
     assert parse_extra_args(
         {"extraArgs": "--log_with tensorboard --flow_shift=3.0"}

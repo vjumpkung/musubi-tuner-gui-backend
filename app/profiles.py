@@ -308,9 +308,7 @@ TRAINING_PROFILES: dict[str, TrainingProfile] = {
                 train_flag="--model_version",
                 options=(
                     "dev",
-                    "klein-4b",
                     "klein-base-4b",
-                    "klein-9b",
                     "klein-base-9b",
                 ),
             ),
