@@ -118,6 +118,32 @@ def test_download_completes_with_progress(client, paths):
     assert done["current_file"] == "diffusion_models/flux2_dev_fp8mixed.safetensors"
 
 
+def test_download_jobs_list_includes_current_statuses_newest_first(client, paths):
+    assert client.get("/api/downloads").json() == []
+    install_script(paths, "download_flux2_dev.sh", FAST_SCRIPT)
+    install_script(paths, "download_framepack.sh", FAILING_SCRIPT)
+
+    completed_job = client.post(
+        "/api/downloads", json={"script_id": "flux2-dev", "destination": "."}
+    ).json()
+    failed_job = client.post(
+        "/api/downloads", json={"script_id": "framepack", "destination": "."}
+    ).json()
+
+    def current_terminal_jobs():
+        jobs = client.get("/api/downloads").json()
+        if len(jobs) == 2 and all(
+            job["status"] in {"completed", "failed"} for job in jobs
+        ):
+            return jobs
+        return None
+
+    jobs = wait_for(current_terminal_jobs)
+
+    assert [job["id"] for job in jobs] == [failed_job["id"], completed_job["id"]]
+    assert [job["status"] for job in jobs] == ["failed", "completed"]
+
+
 def test_hf_token_is_passed_via_environment_and_redacted(client, paths):
     token = "hf_download_secret"
     install_script(paths, "download_flux2_dev.sh", TOKEN_LEAK_SCRIPT)

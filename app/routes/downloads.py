@@ -20,6 +20,11 @@ async def start_download(payload: DownloadRequest, request: Request) -> dict:
     ).to_response()
 
 
+@router.get("")
+async def list_downloads(request: Request) -> list[dict]:
+    return [job.to_response() for job in _manager(request).list_jobs()]
+
+
 @router.get("/{job_id}")
 async def read_download(job_id: str, request: Request) -> dict:
     return _manager(request).get(job_id).to_response()

@@ -89,6 +89,9 @@ class DownloadManager:
             raise HTTPException(status_code=404, detail="Unknown download job")
         return job
 
+    def list_jobs(self) -> list[DownloadJob]:
+        return list(reversed(self.jobs.values()))
+
     def start(
         self, script_id: str, destination_raw: str, hf_token: str | None = None
     ) -> DownloadJob:
