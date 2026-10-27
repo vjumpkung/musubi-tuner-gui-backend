@@ -14,7 +14,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class When:
     key: str
-    value: str | bool
+    value: str | bool | tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,7 @@ class ProfileField:
     train_flag: str | None = None
     required: bool = False
     when: When | None = None
+    workspace_path: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,11 @@ class TrainingProfile:
     fixed_train_flags: tuple[str, ...] = ()
     cpu_threads: int = 2
     task_options: tuple[str, ...] = ()
+    train_options: tuple[CacheOption, ...] = ()
+
+
+H3_NON_TEACHER = ("guidance", "adapter")
+H3_TEACHER = ("teacher-first-last", "teacher-ref", "teacher-subject-ref")
 
 
 TRAINING_PROFILES: dict[str, TrainingProfile] = {
@@ -637,5 +643,204 @@ TRAINING_PROFILES: dict[str, TrainingProfile] = {
             MemoryFlag(key="fp8Base", flag="--fp8_base"),
             MemoryFlag(key="fp8Scaled", flag="--fp8_scaled"),
         ),
+    ),
+    "minimax-h3": TrainingProfile(
+        id="minimax-h3",
+        name="MiniMax H3",
+        trainer="minimax_h3_train_network.py",
+        network_module="networks.lora_minimax_h3",
+        cpu_threads=1,
+        selectors=(
+            Selector(key="task", train_flag=None, options=("t2va", "fl2va", "ref2va")),
+            Selector(
+                key="lossMethod",
+                train_flag=None,
+                options=(*H3_NON_TEACHER, *H3_TEACHER),
+            ),
+        ),
+        cache_commands=(
+            CacheCommand(
+                script="minimax_h3_cache_latents.py",
+                options=(
+                    CacheOption(flag="--dataset_config", key="datasetConfig"),
+                    CacheOption(
+                        flag="--task",
+                        key="task",
+                        when=When(key="lossMethod", value=H3_NON_TEACHER),
+                    ),
+                    CacheOption(
+                        flag="--task",
+                        value="fl2va",
+                        when=When(key="lossMethod", value="teacher-first-last"),
+                    ),
+                    CacheOption(
+                        flag="--task",
+                        value="t2va",
+                        when=When(key="lossMethod", value="teacher-ref"),
+                    ),
+                    CacheOption(
+                        flag="--task",
+                        value="ref2va",
+                        when=When(key="lossMethod", value="teacher-subject-ref"),
+                    ),
+                    CacheOption(flag="--video_vae", key="videoVae"),
+                    CacheOption(flag="--audio_vae", key="audioVae"),
+                    CacheOption(flag="--cache_seed", key="cacheSeed"),
+                    CacheOption(flag="--one_frame", enabled_key="oneFrame"),
+                    CacheOption(flag="--skip_existing"),
+                ),
+            ),
+            CacheCommand(
+                script="minimax_h3_cache_text_encoder_outputs.py",
+                options=(
+                    CacheOption(flag="--dataset_config", key="datasetConfig"),
+                    CacheOption(
+                        flag="--task",
+                        key="task",
+                        when=When(key="lossMethod", value=H3_NON_TEACHER),
+                    ),
+                    CacheOption(
+                        flag="--task",
+                        value="t2va",
+                        when=When(key="lossMethod", value=H3_TEACHER),
+                    ),
+                    CacheOption(flag="--text_encoder", key="textEncoder"),
+                    CacheOption(flag="--batch_size", key="cacheBatchSize"),
+                    CacheOption(flag="--one_frame", enabled_key="oneFrame"),
+                    CacheOption(
+                        flag="--uncond_output",
+                        key="guidanceUncondCache",
+                        when=When(key="lossMethod", value="guidance"),
+                    ),
+                    CacheOption(
+                        flag="--teacher_conditions",
+                        value="first,last",
+                        when=When(key="lossMethod", value="teacher-first-last"),
+                    ),
+                    CacheOption(
+                        flag="--teacher_conditions",
+                        value="ref",
+                        when=When(key="lossMethod", value="teacher-ref"),
+                    ),
+                    CacheOption(
+                        flag="--teacher_conditions",
+                        value="subject_ref",
+                        when=When(key="lossMethod", value="teacher-subject-ref"),
+                    ),
+                    CacheOption(
+                        flag="--text_encoder_blocks_to_swap",
+                        key="textEncoderBlocksToSwap",
+                    ),
+                    CacheOption(
+                        flag="--text_encoder_attn_mode", key="textEncoderAttnMode"
+                    ),
+                    CacheOption(flag="--skip_existing"),
+                ),
+            ),
+        ),
+        train_options=(
+            CacheOption(
+                flag="--task",
+                key="task",
+                when=When(key="lossMethod", value=H3_NON_TEACHER),
+            ),
+            CacheOption(
+                flag="--task",
+                value="t2va",
+                when=When(key="lossMethod", value=H3_TEACHER),
+            ),
+            CacheOption(
+                flag="--h3_teacher_matching",
+                when=When(key="lossMethod", value=H3_TEACHER),
+            ),
+            CacheOption(
+                flag="--h3_teacher_conditions",
+                value="first,last",
+                when=When(key="lossMethod", value="teacher-first-last"),
+            ),
+            CacheOption(
+                flag="--h3_teacher_conditions",
+                value="ref",
+                when=When(key="lossMethod", value="teacher-ref"),
+            ),
+            CacheOption(
+                flag="--h3_teacher_conditions",
+                value="subject_ref",
+                when=When(key="lossMethod", value="teacher-subject-ref"),
+            ),
+        ),
+        model_fields=(
+            ProfileField(key="dit", train_flag="--dit", required=True),
+            ProfileField(key="videoVae", required=True),
+            ProfileField(key="audioVae", required=True),
+            ProfileField(key="textEncoder", required=True),
+            ProfileField(
+                key="baseWeights",
+                train_flag="--base_weights",
+                required=True,
+                when=When(key="lossMethod", value="adapter"),
+            ),
+            ProfileField(
+                key="guidanceUncondCache",
+                train_flag="--h3_guidance_loss_uncond_cache",
+                required=True,
+                when=When(key="lossMethod", value="guidance"),
+                workspace_path=True,
+            ),
+        ),
+        advanced_fields=(
+            ProfileField(
+                key="h3GuidanceLossScale",
+                train_flag="--h3_guidance_loss_scale",
+                when=When(key="lossMethod", value="guidance"),
+            ),
+            ProfileField(
+                key="h3GuidanceLossSigmaMin",
+                train_flag="--h3_guidance_loss_sigma_min",
+                when=When(key="lossMethod", value="guidance"),
+            ),
+            ProfileField(
+                key="h3GuidanceLossScaleAudio",
+                train_flag="--h3_guidance_loss_scale_audio",
+                when=When(key="lossMethod", value="guidance"),
+            ),
+            ProfileField(
+                key="h3TeacherConditionSigmaMin",
+                train_flag="--h3_teacher_condition_sigma_min",
+                when=When(key="lossMethod", value=H3_TEACHER),
+            ),
+            ProfileField(
+                key="h3TeacherConditionSigmaMax",
+                train_flag="--h3_teacher_condition_sigma_max",
+                when=When(key="lossMethod", value=H3_TEACHER),
+            ),
+            ProfileField(
+                key="h3TeacherLossDcWeight",
+                train_flag="--h3_teacher_loss_dc_weight",
+                when=When(key="lossMethod", value=H3_TEACHER),
+            ),
+            ProfileField(
+                key="h3TeacherLossMagWeight",
+                train_flag="--h3_teacher_loss_mag_weight",
+                when=When(key="lossMethod", value=H3_TEACHER),
+            ),
+            ProfileField(
+                key="h3TimestepFocusProb",
+                train_flag="--h3_timestep_focus_prob",
+                when=When(key="lossMethod", value=H3_TEACHER),
+            ),
+            ProfileField(key="audioLossWeight", train_flag="--audio_loss_weight"),
+            ProfileField(key="cacheSeed"),
+            ProfileField(key="textEncoderBlocksToSwap"),
+            ProfileField(key="textEncoderAttnMode"),
+        ),
+        memory_flags=(
+            MemoryFlag(key="oneFrame", flag="--one_frame"),
+            MemoryFlag(key="videoOnly", flag="--video_only"),
+            MemoryFlag(key="convrotInt8", flag="--convrot_int8"),
+            MemoryFlag(key="pruneAdaln", flag="--prune_adaln"),
+            MemoryFlag(key="splitAttn", flag="--split_attn"),
+        ),
+        attention_options=("sdpa", "flash_attn", "sage_attn", "xformers"),
     ),
 }

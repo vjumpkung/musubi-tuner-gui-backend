@@ -68,10 +68,10 @@ database write lock consistently when changing job ownership, status, or queue p
 FIFO ordering and renumber queued jobs after cancellation or reordering. Ensure application
 shutdown terminates child process trees and closes downloads, runner tasks, and the database.
 
-Build subprocess commands as argument lists and execute them without a shell. Keep download scripts
-strictly allowlisted. Do not weaken `extraArgs` validation or pass untrusted strings into shell
-commands. Secrets such as Hugging Face tokens must never appear in API responses, errors, or logs;
-maintain redaction whenever command logging changes.
+Build subprocess commands as argument lists and execute them without a shell. Use catalog-only
+download URLs; never accept URLs or file paths from download requests. Do not weaken `extraArgs`
+validation or pass untrusted strings into shell commands. Secrets such as Hugging Face tokens must
+never appear in API responses, errors, or logs; maintain redaction whenever command logging changes.
 
 ## Filesystem and Configuration Safety
 

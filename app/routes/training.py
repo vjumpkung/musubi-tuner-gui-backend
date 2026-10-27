@@ -18,7 +18,12 @@ from ..db import Database, utc_now
 from ..profiles import TRAINING_PROFILES
 from ..schemas.training import ReorderRequest, TrainingJobRequest
 from ..services.queue_runner import QueueRunner, renumber_queue
-from ..utils.command_builder import ExtraArgsError, ValuesError, validate_values
+from ..utils.command_builder import (
+    ExtraArgsError,
+    ValuesError,
+    condition_matches,
+    validate_values,
+)
 from .datasets import render_toml
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
@@ -365,6 +370,20 @@ async def create_job(payload: TrainingJobRequest, request: Request) -> dict:
         except ValueError:
             raise HTTPException(
                 status_code=400, detail=f"{key} must resolve inside the workspace root"
+            )
+
+    for field in profile.model_fields:
+        if not field.workspace_path or not condition_matches(values, field.when):
+            continue
+        raw = str(values.get(field.key) or "").strip()
+        if not raw:
+            continue
+        try:
+            settings.resolve_inside_workspace(raw)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field.key} must resolve inside the workspace root",
             )
 
     if shutil.which("accelerate") is None:

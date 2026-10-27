@@ -1,4 +1,3 @@
-import os
 import sys
 import time
 from pathlib import Path
@@ -8,17 +7,13 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-GIT_BASH_DIR = Path(r"C:\Program Files\Git\bin")
-
 
 @pytest.fixture
 def paths(tmp_path):
     layout = {
         "data": tmp_path / "data",
-        "scripts": tmp_path / "scripts",
         "workspace": tmp_path / "workspace",
     }
-    layout["scripts"].mkdir()
     layout["workspace"].mkdir()
     return layout
 
@@ -26,12 +21,8 @@ def paths(tmp_path):
 @pytest.fixture
 def make_client(paths, monkeypatch):
     monkeypatch.setenv("MUSUBI_GUI_DATA_ROOT", str(paths["data"]))
-    monkeypatch.setenv("MUSUBI_GUI_SCRIPTS_DIR", str(paths["scripts"]))
     monkeypatch.setenv("MUSUBI_GUI_WORKSPACE_ROOT", str(paths["workspace"]))
     monkeypatch.setenv("MUSUBI_GUI_WEB_DIR", str(paths["workspace"] / "no-web"))
-    if os.name == "nt" and (GIT_BASH_DIR / "bash.exe").is_file():
-        # The WSL bash stub in system32 has no distro; prefer Git Bash.
-        monkeypatch.setenv("PATH", f"{GIT_BASH_DIR}{os.pathsep}{os.environ['PATH']}")
 
     from app.main import create_app
 

@@ -3,48 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import re
-import shutil
+import os
 import uuid
-from collections import deque
-from dataclasses import dataclass, field
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 from fastapi import HTTPException
 
 from ..config import Settings
-from ..utils.process import spawn, terminate_tree
-
-# script_id -> fixed filename. Never accept a filename or shell command from the request.
-SCRIPT_ALLOWLIST: dict[str, str] = {
-    "flux2-dev": "download_flux2_dev.sh",
-    "flux2-klein-base-4b": "download_flux2_klein_base_4b.sh",
-    "flux2-klein-base-9b": "download_flux2_klein_base_9b.sh",
-    "flux-kontext-dev": "download_flux_kontext_dev.sh",
-    "framepack": "download_framepack.sh",
-    "hidream-o1": "download_hidream_o1.sh",
-    "hunyuan-video": "download_hunyuan_video.sh",
-    "hunyuan-video-1-5": "download_hunyuan_video_1_5.sh",
-    "ideogram-4": "download_ideogram4.sh",
-    "kandinsky-5-t2v": "download_kandinsky5_t2v.sh",
-    "krea-2": "download_krea2.sh",
-    "qwen-image-bf16": "download_qwen_image_fp16.sh",
-    "qwen-image-fp8": "download_qwen_image_fp8.sh",
-    "qwen-image-edit": "download_qwen_image_edit_fp16.sh",
-    "qwen-image-edit-2509": "download_qwen_image_edit_2509_fp16.sh",
-    "wan-2-1-t2v-14b": "download_wan21_t2v_14B_fp16.sh",
-    "wan-2-1-i2v-14b": "download_wan21_i2v_14B_fp16.sh",
-    "wan-2-2-t2v-14b": "download_wan22_t2v_14B_fp16.sh",
-    "wan-2-2-i2v-14b": "download_wan22_i2v_14B_fp16.sh",
-    "z-image-base": "download_z_image_base_bf16.sh",
-    "z-image-turbo": "download_z_image_turbo_bf16.sh",
-}
-
-ACTIVE_STATUSES = {"queued", "running"}
-MODEL_DIR_PATTERN = re.compile(
-    r"(?:diffusion_models|vae|text_encoders|image_encoder)/[\w./+-]+"
-)
-PERCENT_PATTERN = re.compile(r"(?<![\w.])(\d{1,3})%")
+from ..download_catalog import DOWNLOAD_MODELS
+from ..schemas.downloads import DownloadModel
 
 
 @dataclass
@@ -57,9 +27,10 @@ class DownloadJob:
     current_file: str | None = None
     message: str | None = "Waiting to start"
     error: str | None = None
-    process: asyncio.subprocess.Process | None = None
-    task: asyncio.Task | None = None
-    last_lines: deque[str] = field(default_factory=lambda: deque(maxlen=20))
+    task: asyncio.Task[None] | None = None
+    targets: tuple[Path, ...] = ()
+    started: bool = False
+    cancel_requested: bool = False
 
     def to_response(self) -> dict:
         payload: dict = {
@@ -81,7 +52,9 @@ class DownloadJob:
 class DownloadManager:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.transport: httpx.AsyncBaseTransport | None = None
         self.jobs: dict[str, DownloadJob] = {}
+        self.reservations: dict[Path, str] = {}
 
     def get(self, job_id: str) -> DownloadJob:
         job = self.jobs.get(job_id)
@@ -95,153 +68,171 @@ class DownloadManager:
     def start(
         self, script_id: str, destination_raw: str, hf_token: str | None = None
     ) -> DownloadJob:
-        filename = SCRIPT_ALLOWLIST.get(script_id)
-        if filename is None:
-            raise HTTPException(status_code=404, detail="Unknown download script")
-        script_path = self.settings.scripts_dir / filename
-        if not script_path.is_file():
-            raise HTTPException(
-                status_code=503, detail=f"Download script is not installed: {filename}"
-            )
-        # Resolve bash through PATH ourselves: on Windows CreateProcess would search
-        # system32 first and hit the WSL stub instead of Git Bash.
-        bash = shutil.which("bash")
-        if bash is None:
-            raise HTTPException(
-                status_code=503, detail="bash is not available on the server"
-            )
-        if shutil.which("hf") is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Hugging Face hf CLI is not available on the server",
-            )
-
+        model = DOWNLOAD_MODELS.get(script_id)
+        if model is None:
+            raise HTTPException(status_code=404, detail="Unknown download model")
         try:
             destination = self.settings.resolve_inside_workspace(destination_raw or ".")
+            targets = tuple((destination / file.path).resolve() for file in model.files)
+            if any(not target.is_relative_to(destination) for target in targets):
+                raise ValueError
         except ValueError:
             raise HTTPException(
                 status_code=400, detail="Destination is outside the allowed root"
             )
-
-        for existing in self.jobs.values():
-            if (
-                existing.script_id == script_id
-                and existing.destination == destination
-                and existing.status in ACTIVE_STATUSES
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="This script already has an active job for that destination",
-                )
+        if any(target in self.reservations for target in targets):
+            raise HTTPException(
+                status_code=409,
+                detail="A download target already has an active job",
+            )
 
         destination.mkdir(parents=True, exist_ok=True)
         job = DownloadJob(
-            id=str(uuid.uuid4()), script_id=script_id, destination=destination
+            id=str(uuid.uuid4()),
+            script_id=script_id,
+            destination=destination,
+            targets=targets,
         )
         self.jobs[job.id] = job
-        job.task = asyncio.create_task(self._run(job, bash, script_path, hf_token))
+        for target in targets:
+            self.reservations[target] = job.id
+        token = hf_token or os.environ.get("HF_TOKEN")
+        job.task = asyncio.create_task(self._run(job, model, token))
         return job
 
+    def _release(self, job: DownloadJob) -> None:
+        for target in job.targets:
+            if self.reservations.get(target) == job.id:
+                del self.reservations[target]
+
     async def _run(
-        self,
-        job: DownloadJob,
-        bash: str,
-        script_path: Path,
-        hf_token: str | None,
+        self, job: DownloadJob, model: DownloadModel, token: str | None
     ) -> None:
-        if job.status == "cancelled":
-            return
+        job.started = True
         try:
-            environment = {"HF_TOKEN": hf_token} if hf_token else None
-            job.process = await spawn(
-                [bash, str(script_path)], cwd=job.destination, env=environment
-            )
-        except asyncio.CancelledError:
-            if job.process is not None:
-                await terminate_tree(job.process)
-            raise
-        except OSError as error:
-            if job.status == "cancelled":
-                return
-            job.status = "failed"
-            job.error = f"Could not start the download script: {error}"
-            job.message = None
-            return
-
-        # Cancellation can arrive while create_subprocess_exec is awaiting the
-        # child process. In that case, never resurrect the job as running.
-        if job.status == "cancelled":
-            await terminate_tree(job.process)
-            return
-        job.status = "running"
-        job.message = "Download started"
-        assert job.process.stdout is not None
-        async for raw_line in job.process.stdout:
-            line = raw_line.decode("utf-8", errors="replace").rstrip()
-            if not line.strip():
-                continue
-            safe_line = line.replace(hf_token, "***") if hf_token else line
-            job.last_lines.append(safe_line)
-            self._apply_line(job, safe_line)
-
-        return_code = await job.process.wait()
-        if job.status == "cancelled":
-            return
-        if return_code == 0:
+            job.status = "running"
+            async with httpx.AsyncClient(
+                transport=self.transport,
+                follow_redirects=True,
+                timeout=httpx.Timeout(60, connect=30),
+                headers={"Accept-Encoding": "identity"},
+            ) as client:
+                count = len(model.files)
+                for index, file in enumerate(model.files):
+                    job.current_file = file.path
+                    job.message = f"Downloading {file.path} ({index + 1}/{count})"
+                    target = job.destination / file.path
+                    temporary = target.parent / f".{target.name}.{job.id}.part"
+                    created = False
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        if not target.parent.resolve().is_relative_to(job.destination):
+                            job.error = (
+                                f"Download path is outside destination: {file.path}"
+                            )
+                            return
+                        headers = {"Authorization": f"Bearer {token}"} if token else {}
+                        async with client.stream(
+                            "GET", file.url, headers=headers
+                        ) as response:
+                            if response.status_code != 200:
+                                if response.status_code in {401, 403}:
+                                    job.error = (
+                                        f"Access denied for {file.path}: accept the model "
+                                        "license on Hugging Face and provide a token"
+                                    )
+                                elif response.status_code == 404:
+                                    job.error = (
+                                        f"File not found on Hugging Face: {file.path}"
+                                    )
+                                else:
+                                    job.error = (
+                                        f"Download failed for {file.path} "
+                                        f"(HTTP {response.status_code})"
+                                    )
+                                return
+                            if (
+                                response.headers.get(
+                                    "Content-Encoding", "identity"
+                                ).lower()
+                                != "identity"
+                            ):
+                                job.error = (
+                                    f"Unexpected content encoding for {file.path}"
+                                )
+                                return
+                            length = response.headers.get("Content-Length")
+                            expected = int(length) if length is not None else None
+                            written = 0
+                            with temporary.open("xb") as handle:
+                                created = True
+                                async for chunk in response.aiter_bytes(1024 * 1024):
+                                    handle.write(chunk)
+                                    written += len(chunk)
+                                    fraction = (
+                                        min(written / expected, 1) if expected else 0
+                                    )
+                                    job.progress = min(
+                                        (index + fraction) / count * 100, 99.9
+                                    )
+                            if expected is not None and written != expected:
+                                job.error = f"Incomplete download for {file.path}"
+                                return
+                            if any(
+                                not path.resolve().is_relative_to(job.destination)
+                                for path in (temporary, target)
+                            ):
+                                job.error = (
+                                    f"Download path is outside destination: {file.path}"
+                                )
+                                return
+                            os.replace(temporary, target)
+                            job.progress = min((index + 1) / count * 100, 99.9)
+                    finally:
+                        if created:
+                            temporary.unlink(missing_ok=True)
             job.status = "completed"
             job.progress = 100
             job.message = "Download completed"
-        else:
-            job.status = "failed"
-            job.message = None
-            job.error = (
-                "\n".join(job.last_lines) or f"Script exited with code {return_code}"
-            )
-
-    def _apply_line(self, job: DownloadJob, line: str) -> None:
-        """Best-effort progress from the script's echo/hf output."""
-        job.message = line[-300:]
-        file_match = MODEL_DIR_PATTERN.search(line)
-        if file_match:
-            job.current_file = file_match.group(0)
-        percent_match = None
-        for percent_match in PERCENT_PATTERN.finditer(line):
-            pass
-        if percent_match:
-            value = int(percent_match.group(1))
-            if 0 <= value <= 100:
-                job.progress = value
+        except asyncio.CancelledError:
+            job.status = "cancelled"
+            job.message = "Cancelled"
+            raise
+        except httpx.HTTPError:
+            job.error = f"Download failed for {job.current_file}: network error"
+        except (OSError, ValueError):
+            job.error = f"Download failed for {job.current_file}"
+        finally:
+            if job.error and job.status != "cancelled":
+                job.status = "failed"
+                job.message = None
+            self._release(job)
 
     async def cancel(self, job_id: str) -> DownloadJob:
         job = self.get(job_id)
-        if job.status == "cancelled":
-            return job
         if job.status in {"completed", "failed"}:
             raise HTTPException(
                 status_code=409, detail=f"A {job.status} job can no longer be cancelled"
             )
         job.status = "cancelled"
         job.message = "Cancelled"
-        if job.process is not None:
-            await terminate_tree(job.process)
+        if not job.cancel_requested:
+            job.cancel_requested = True
+            if job.task is not None and not job.task.done():
+                job.task.cancel()
+        if job.task is not None:
+            while not job.task.done():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.shield(job.task)
+            if not job.started:
+                self._release(job)
         return job
 
     async def shutdown(self) -> None:
-        for job in self.jobs.values():
-            if job.status in ACTIVE_STATUSES and job.process is not None:
-                await terminate_tree(job.process)
-            if job.task is not None and not job.task.done():
-                try:
-                    # A cancelled job may still be returning from process
-                    # creation and performing its own terminate_tree call.
-                    await asyncio.wait_for(asyncio.shield(job.task), timeout=15)
-                except TimeoutError:
-                    if job.process is not None:
-                        await terminate_tree(job.process)
-                    job.task.cancel()
-                    try:
-                        await job.task
-                    except asyncio.CancelledError:
-                        pass
-                except asyncio.CancelledError:
-                    pass
+        await asyncio.gather(
+            *(
+                self.cancel(job.id)
+                for job in self.jobs.values()
+                if job.task is not None and not job.task.done()
+            )
+        )

@@ -3,7 +3,7 @@
 FastAPI backend for the musubi-tuner GUI. Implements the contract in
 `musubi-tuner-gui-frontend/docs/download-api.md`:
 
-- **Downloads** — runs allowlisted model download scripts as async jobs.
+- **Downloads** — fetches fixed catalog model bundles as async jobs.
 - **Dataset manager** — stores musubi-tuner dataset configs, managed captioned media, control
   images, and TOML import/export.
 - **Training job queue** — executes training jobs one at a time through a FIFO queue.
@@ -49,7 +49,7 @@ inside the app, and multiple workers would double-execute jobs.
 | Variable                    | Default                  | Purpose                                             |
 | --------------------------- | ------------------------ | --------------------------------------------------- |
 | `MUSUBI_GUI_DATA_ROOT`      | `./data`                 | SQLite database, job logs, dataset TOML snapshots   |
-| `MUSUBI_GUI_SCRIPTS_DIR`    | `./scripts`              | Allowlisted `download_*.sh` scripts                 |
+| `HF_TOKEN`                  | unset                    | Optional download token when the request omits one  |
 | `MUSUBI_GUI_WORKSPACE_ROOT` | current directory        | Root confining download destinations, `musubiPath`, and output/logging dirs |
 | `MUSUBI_GUI_WEB_DIR`        | `./web`                  | Built Vite frontend served in production            |
 | `MUSUBI_GUI_CORS_ORIGINS`   | Vite dev origins on 5173 | Comma-separated allowed CORS origins                |
@@ -72,10 +72,11 @@ files use the target stem (`a.jpg` + control `a.png`) or numbered stems such as 
 multiple image and video `[[datasets]]` entries, each with its own resolution, cache directory,
 sampling settings, and `num_repeats` value.
 
-The download scripts are not part of this repository — place the `download_*.sh` files
-listed in the API contract into `scripts/`. Server tools required at runtime: `bash` and
-the Hugging Face `hf` CLI (downloads), plus `python` and `accelerate` on `PATH`
-(training stages).
+Downloads fetch catalog URLs from `huggingface.co` directly with HTTPX; no bash or hf CLI
+is needed. Supply a token in the request or use the optional `HF_TOKEN` environment
+fallback. Cached `hf auth login` credentials are not read. Files are re-downloaded and
+replaced on every run; downloads do not reuse the Hugging Face cache or resume transfers.
+Training stages require `python` and `accelerate` on `PATH`.
 
 ## Tests
 

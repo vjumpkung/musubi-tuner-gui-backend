@@ -12,7 +12,7 @@ import re
 import shlex
 from pathlib import Path
 
-from ..profiles import CacheCommand, TrainingProfile, When
+from ..profiles import CacheCommand, CacheOption, TrainingProfile, When
 
 EXTRA_ARG_TOKEN = re.compile(r"^[A-Za-z0-9_.\/=:,+()\-]+$")
 
@@ -39,8 +39,15 @@ def _enabled(values: dict, key: str) -> bool:
     return values.get(key) is True
 
 
-def _matches(values: dict, when: When | None) -> bool:
-    return when is None or values.get(when.key) == when.value
+def condition_matches(values: dict, when: When | None) -> bool:
+    if when is None:
+        return True
+    value = values.get(when.key)
+    if isinstance(value, str):
+        value = value.strip()
+    if isinstance(when.value, tuple):
+        return value in when.value
+    return value == when.value
 
 
 def _argument(values: dict, flag: str, key: str) -> list[str]:
@@ -54,7 +61,7 @@ def validate_values(profile: TrainingProfile, values: dict) -> None:
         field.key
         for field in profile.model_fields
         if field.required
-        and _matches(values, field.when)
+        and condition_matches(values, field.when)
         and not _text(values, field.key)
     ]
     for key in ("outputName", "outputDir", "musubiPath"):
@@ -103,6 +110,22 @@ def parse_extra_args(values: dict) -> list[str]:
     return tokens
 
 
+def _option_argv(
+    option: CacheOption, values: dict, dataset_config_path: Path
+) -> list[str]:
+    if not condition_matches(values, option.when):
+        return []
+    if option.enabled_key is not None:
+        return [option.flag] if _enabled(values, option.enabled_key) else []
+    if option.key is not None:
+        if option.key == "datasetConfig":
+            return [option.flag, str(dataset_config_path)]
+        return _argument(values, option.flag, option.key)
+    if option.value is not None:
+        return [option.flag, option.value]
+    return [option.flag]
+
+
 def _cache_argv(
     command: CacheCommand,
     values: dict,
@@ -111,22 +134,7 @@ def _cache_argv(
 ) -> list[str]:
     argv = ["python", str(musubi_path / command.script)]
     for option in command.options:
-        if not _matches(values, option.when):
-            continue
-        if option.enabled_key is not None:
-            if _enabled(values, option.enabled_key):
-                argv.append(option.flag)
-            continue
-        if option.key is not None:
-            if option.key == "datasetConfig":
-                argv += [option.flag, str(dataset_config_path)]
-            else:
-                argv += _argument(values, option.flag, option.key)
-            continue
-        if option.value is not None:
-            argv += [option.flag, option.value]
-            continue
-        argv.append(option.flag)
+        argv += _option_argv(option, values, dataset_config_path)
     return argv
 
 
@@ -152,8 +160,10 @@ def _train_argv(
         if selector.train_flag:
             args += argument(selector.train_flag, selector.key)
     for field in train_fields:
-        if field.train_flag and _matches(values, field.when):
+        if field.train_flag and condition_matches(values, field.when):
             args += argument(field.train_flag, field.key)
+    for option in profile.train_options:
+        args += _option_argv(option, values, dataset_config_path)
     args += [
         "--network_module",
         profile.network_module,

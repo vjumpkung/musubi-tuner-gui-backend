@@ -33,12 +33,6 @@ class Settings:
     data_root: Path = field(
         default_factory=lambda: _env_path("MUSUBI_GUI_DATA_ROOT", BACKEND_ROOT / "data")
     )
-    # Allowlisted download scripts are looked up here by fixed filename.
-    scripts_dir: Path = field(
-        default_factory=lambda: _env_path(
-            "MUSUBI_GUI_SCRIPTS_DIR", BACKEND_ROOT / "scripts"
-        )
-    )
     # Download destinations, musubiPath, and output/logging dirs must resolve inside this root.
     workspace_root: Path = field(
         default_factory=lambda: _env_path("MUSUBI_GUI_WORKSPACE_ROOT", Path.cwd())

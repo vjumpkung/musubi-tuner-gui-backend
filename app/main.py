@@ -15,7 +15,9 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -152,6 +154,18 @@ class SpaStaticFiles(StaticFiles):
 def create_app() -> FastAPI:
     settings = load_settings()
     app = FastAPI(title="musubi-tuner-gui backend", lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(
+        request: Request, error: RequestValidationError
+    ) -> Response:
+        if request.url.path == "/api/downloads" or request.url.path.startswith(
+            "/api/downloads/"
+        ):
+            return JSONResponse(
+                status_code=422, content={"detail": "Invalid download request"}
+            )
+        return await request_validation_exception_handler(request, error)
 
     # Added first so the subsequently-added CORS middleware wraps direct 413
     # responses from the body limiter as well as normal FastAPI responses.

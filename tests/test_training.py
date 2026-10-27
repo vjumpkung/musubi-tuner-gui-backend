@@ -105,6 +105,61 @@ def make_dataset(client):
     return response.json()["id"]
 
 
+@pytest.mark.parametrize(
+    ("method", "outside", "expected_status"),
+    [
+        ("guidance", True, 400),
+        ("guidance ", True, 400),
+        ("guidance", False, 202),
+        ("adapter", True, 202),
+        ("teacher-first-last", True, 202),
+        ("teacher-ref ", True, 202),
+        ("teacher-subject-ref", True, 202),
+    ],
+)
+def test_h3_active_workspace_path_validation(
+    training_client, paths, tmp_path, method, outside, expected_status
+):
+    from app.profiles import TRAINING_PROFILES
+
+    profile = TRAINING_PROFILES["minimax-h3"]
+    musubi = paths["workspace"] / "musubi-tuner"
+    for filename in (
+        profile.cache_commands[0].script,
+        profile.cache_commands[1].script,
+        profile.trainer,
+    ):
+        (musubi / filename).touch()
+    uncond = (
+        str(tmp_path / "outside.safetensors") if outside else "./new/uncond.safetensors"
+    )
+    assert not (paths["workspace"] / uncond).exists()
+    dataset_id = make_dataset(training_client)
+    response = training_client.post(
+        "/api/training/jobs",
+        json={
+            "name": "H3 job",
+            "profile_id": "minimax-h3",
+            "dataset_config_id": dataset_id,
+            "values": {
+                **JOB_VALUES,
+                "task": "t2va",
+                "lossMethod": method,
+                "videoVae": "./vae/video.safetensors",
+                "audioVae": "./vae/audio.safetensors",
+                "textEncoder": "./text_encoders/h3.safetensors",
+                "baseWeights": "./adapter.safetensors",
+                "guidanceUncondCache": uncond,
+            },
+        },
+    )
+    assert response.status_code == expected_status, response.text
+    if expected_status == 400:
+        assert response.json() == {
+            "detail": "guidanceUncondCache must resolve inside the workspace root"
+        }
+
+
 def make_job(
     client, dataset_id, name="job", stub_mode="ok", skip_cache=False, values=None
 ):
@@ -771,7 +826,6 @@ async def test_runner_does_not_claim_a_cancelled_or_paused_job(tmp_path):
         db,
         Settings(
             data_root=tmp_path,
-            scripts_dir=tmp_path,
             workspace_root=workspace,
             web_dir=tmp_path / "web",
             cors_origins=(),

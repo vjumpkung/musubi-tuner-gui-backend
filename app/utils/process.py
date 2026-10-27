@@ -1,6 +1,6 @@
 """Cross-platform subprocess spawning and process-tree termination.
 
-The production target is Linux (bash download scripts, POSIX process groups);
+The production target is Linux (training subprocesses, POSIX process groups);
 the Windows branch keeps local development working.
 """
 
