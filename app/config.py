@@ -27,6 +27,13 @@ def _env_positive_int(name: str, default: int) -> int:
     return value
 
 
+def _env_optional_positive_int(name: str) -> int | None:
+    """Return None when unset or empty; otherwise require a positive integer."""
+    if not os.environ.get(name, "").strip():
+        return None
+    return _env_positive_int(name, 1)
+
+
 @dataclass(frozen=True)
 class Settings:
     # Database, job logs, and dataset snapshots live under this directory.
@@ -41,8 +48,11 @@ class Settings:
     web_dir: Path = field(
         default_factory=lambda: _env_path("MUSUBI_GUI_WEB_DIR", BACKEND_ROOT / "web")
     )
-    managed_max_files: int = field(
-        default_factory=lambda: _env_positive_int("MUSUBI_GUI_MANAGED_MAX_FILES", 1000)
+    # Unset means managed uploads have no file-count limit.
+    managed_max_files: int | None = field(
+        default_factory=lambda: _env_optional_positive_int(
+            "MUSUBI_GUI_MANAGED_MAX_FILES"
+        )
     )
     managed_max_file_bytes: int = field(
         default_factory=lambda: _env_positive_int(

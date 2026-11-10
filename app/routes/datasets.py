@@ -9,6 +9,7 @@ import shutil
 import tomllib
 import uuid
 from pathlib import Path
+from typing import BinaryIO, cast
 
 import aiosqlite
 import tomli_w
@@ -246,6 +247,24 @@ def _available_staged_tokens(directory: Path) -> set[str]:
     return tokens
 
 
+class _StagedUploadReader:
+    """Read a staged upload without holding a file descriptor between reads."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._position = 0
+
+    def read(self, size: int = -1) -> bytes:
+        with self._path.open("rb") as source:
+            source.seek(self._position)
+            data = source.read(size)
+        self._position += len(data)
+        return data
+
+    def close(self) -> None:
+        pass
+
+
 def _open_staged_uploads(
     directory: Path, tokens: list[str], expected_kind: str
 ) -> list[UploadFile]:
@@ -284,7 +303,7 @@ def _open_staged_uploads(
                 )
             uploads.append(
                 UploadFile(
-                    file=data_path.open("rb"),
+                    file=cast(BinaryIO, _StagedUploadReader(data_path)),
                     size=data_path.stat().st_size,
                     filename=filename,
                     headers=Headers({"content-type": content_type}),
@@ -851,7 +870,10 @@ async def upload_managed_session_file(
             )
         async with request.app.state.managed_upload_lock:
             directory = _staged_session_directory(settings, session_id)
-            if len(_available_staged_tokens(directory)) >= settings.managed_max_files:
+            if (
+                settings.managed_max_files is not None
+                and len(_available_staged_tokens(directory)) >= settings.managed_max_files
+            ):
                 raise HTTPException(
                     status_code=413,
                     detail=(
@@ -1492,7 +1514,10 @@ async def create_managed_dataset(
     control_files = control_files or []
     settings = request.app.state.settings
     upload_count = len(files) + len(caption_files) + len(control_files)
-    if upload_count > settings.managed_max_files:
+    if (
+        settings.managed_max_files is not None
+        and upload_count > settings.managed_max_files
+    ):
         raise HTTPException(
             status_code=413,
             detail=f"A managed dataset upload may contain at most {settings.managed_max_files} files",
@@ -1800,7 +1825,10 @@ async def create_managed_dataset_batch(
     control_files = control_files or []
     settings = request.app.state.settings
     upload_count = len(files) + len(caption_files) + len(control_files)
-    if upload_count > settings.managed_max_files:
+    if (
+        settings.managed_max_files is not None
+        and upload_count > settings.managed_max_files
+    ):
         raise HTTPException(
             status_code=413,
             detail=f"A managed dataset upload may contain at most {settings.managed_max_files} files",
@@ -2148,7 +2176,10 @@ async def update_managed_dataset_files(
     control_files = control_files or []
     settings = request.app.state.settings
     upload_count = len(files) + len(caption_files) + len(control_files)
-    if upload_count > settings.managed_max_files:
+    if (
+        settings.managed_max_files is not None
+        and upload_count > settings.managed_max_files
+    ):
         raise HTTPException(
             status_code=413,
             detail=f"A managed dataset upload may contain at most {settings.managed_max_files} files",

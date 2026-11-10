@@ -53,11 +53,16 @@ inside the app, and multiple workers would double-execute jobs.
 | `MUSUBI_GUI_WORKSPACE_ROOT` | current directory        | Root confining download destinations, `musubiPath`, and output/logging dirs |
 | `MUSUBI_GUI_WEB_DIR`        | `./web`                  | Built Vite frontend served in production            |
 | `MUSUBI_GUI_CORS_ORIGINS`   | Vite dev origins on 5173 | Comma-separated allowed CORS origins                |
-| `MUSUBI_GUI_MANAGED_MAX_FILES` | `1000`                 | Maximum files in one managed dataset upload         |
+| `MUSUBI_GUI_MANAGED_MAX_FILES` | unset (no limit)       | Optional maximum files in one managed dataset upload |
 | `MUSUBI_GUI_MANAGED_MAX_FILE_BYTES` | `107374182400` (100 GiB) | Maximum bytes for one uploaded media or control file |
 | `MUSUBI_GUI_MANAGED_MAX_TOTAL_BYTES` | `1099511627776` (1 TiB) | Maximum combined media bytes in one upload    |
 | `MUSUBI_GUI_MANAGED_MAX_REQUEST_BYTES` | `1181116006400` (1.07 TiB) | Maximum full multipart request-body bytes before parsing |
 | `MUSUBI_GUI_MANAGED_MAX_STORAGE_BYTES` | `10995116277760` (10 TiB) | Maximum aggregate bytes under managed dataset storage |
+
+The browser UI stages managed uploads one file per request, so a dataset may contain any number
+of files within the byte quotas. Direct multipart calls to `POST /api/datasets/managed`,
+`POST /api/datasets/managed/batch`, and `PUT /api/datasets/{id}/managed` remain bounded by
+Starlette's form parser at 1000 file parts per request (HTTP 400).
 
 Managed upload admission is serialized in the required single-worker server so concurrent
 requests cannot overcommit the aggregate storage quota. Failed creations and deletions use

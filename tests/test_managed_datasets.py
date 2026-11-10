@@ -902,6 +902,120 @@ def test_managed_dataset_upload_quotas_return_413_and_clean_up(
         assert list((paths["data"] / "managed_datasets").iterdir()) == []
 
 
+def test_managed_file_count_limit_is_disabled_by_default(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.delenv("MUSUBI_GUI_MANAGED_MAX_FILES", raising=False)
+    assert Settings().managed_max_files is None
+
+    monkeypatch.setenv("MUSUBI_GUI_MANAGED_MAX_FILES", "")
+    assert Settings().managed_max_files is None
+
+    monkeypatch.setenv("MUSUBI_GUI_MANAGED_MAX_FILES", "2")
+    assert Settings().managed_max_files == 2
+
+    monkeypatch.setenv("MUSUBI_GUI_MANAGED_MAX_FILES", "0")
+    with pytest.raises(ValueError):
+        Settings()
+
+
+def test_staged_upload_file_count_limit_applies_when_configured(
+    make_client, monkeypatch
+):
+    monkeypatch.setenv("MUSUBI_GUI_MANAGED_MAX_FILES", "1")
+    with make_client() as limited_client:
+        session_id = _staged_session(limited_client)
+        _stage_file(limited_client, session_id, "one.png", b"1", "image/png")
+
+        response = limited_client.post(
+            f"/api/datasets/managed/upload-sessions/{session_id}/files",
+            data={"kind": "target"},
+            files={"file": ("two.png", io.BytesIO(b"2"), "image/png")},
+        )
+
+        assert response.status_code == 413
+        assert response.json()["detail"] == (
+            "A managed dataset upload may contain at most 1 files"
+        )
+
+
+def test_staged_finalize_reads_staged_files_one_at_a_time(client, paths, monkeypatch):
+    first_content = b"a" * (1024 * 1024 + 17)
+    session_id = _staged_session(client)
+    first_token = _stage_file(client, session_id, "a.png", first_content, "image/png")
+    second_token = _stage_file(client, session_id, "b.png", b"second", "image/png")
+    caption_token = _stage_file(
+        client, session_id, "a.txt", b"sidecar caption", "text/plain", "caption"
+    )
+    payload = {
+        "name": "descriptor bounded finalize",
+        "dataset_specs": [
+            {
+                "media_type": "image",
+                "resolution": [512, 512],
+                "num_repeats": 1,
+                "additional_options": "",
+                "captions": ["", "second caption"],
+                "file_count": 2,
+                "caption_file_count": 1,
+                "control_file_count": 0,
+            }
+        ],
+        "file_tokens": [first_token, second_token],
+        "caption_file_tokens": [caption_token],
+        "control_file_tokens": [],
+    }
+
+    real_open = Path.open
+    state = {"open": 0, "peak": 0}
+
+    class TrackedHandle:
+        def __init__(self, handle):
+            self._handle = handle
+            self._closed = False
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self.close()
+
+        def close(self):
+            if not self._closed:
+                self._closed = True
+                state["open"] -= 1
+            self._handle.close()
+
+    def tracking_open(self, mode="r", *args, **kwargs):
+        handle = real_open(self, mode, *args, **kwargs)
+        if mode == "rb" and self.name.endswith(".data"):
+            state["open"] += 1
+            state["peak"] = max(state["peak"], state["open"])
+            return TrackedHandle(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+
+    response = client.post(
+        f"/api/datasets/managed/upload-sessions/{session_id}/finalize",
+        json=payload,
+    )
+
+    assert response.status_code == 201, response.text
+    assert state["peak"] == 1
+    managed_dir = (
+        paths["data"] / "managed_datasets" / response.json()["id"] / "dataset-1"
+    )
+    assert (managed_dir / "media" / "a.png").read_bytes() == first_content
+    assert (managed_dir / "media" / "a.txt").read_text(encoding="utf-8") == (
+        "sidecar caption"
+    )
+    assert (managed_dir / "media" / "b.png").read_bytes() == b"second"
+
+
 def test_managed_request_content_length_is_rejected_before_parsing(
     make_client, monkeypatch
 ):
