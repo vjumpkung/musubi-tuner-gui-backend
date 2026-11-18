@@ -181,6 +181,18 @@ def get_job(client, job_id):
     return client.get(f"/api/training/jobs/{job_id}").json()
 
 
+def post_job(client, dataset_id, values):
+    return client.post(
+        "/api/training/jobs",
+        json={
+            "name": "values job",
+            "profile_id": "wan-22",
+            "dataset_config_id": dataset_id,
+            "values": values,
+        },
+    )
+
+
 def test_job_creation_rechecks_dataset_after_concurrent_managed_delete(
     training_client, paths, monkeypatch
 ):
@@ -302,6 +314,42 @@ def test_create_validations(training_client):
     assert missing_musubi.status_code == 503
 
 
+def test_boolean_values_must_be_json_booleans(training_client):
+    dataset_id = make_dataset(training_client)
+
+    for value in ("true", "false", 1):
+        response = post_job(
+            training_client,
+            dataset_id,
+            {**JOB_VALUES, "gradientCheckpointing": value},
+        )
+        assert response.status_code == 422
+        assert response.json() == {
+            "detail": "gradientCheckpointing must be a JSON boolean (true or false)"
+        }
+    assert training_client.get("/api/training/jobs").json() == []
+
+    accepted = post_job(
+        training_client, dataset_id, {**JOB_VALUES, "gradientCheckpointing": True}
+    )
+    assert accepted.status_code == 202
+    assert accepted.json()["warnings"] == []
+
+
+def test_unknown_values_are_accepted_with_a_warning(training_client):
+    dataset_id = make_dataset(training_client)
+
+    response = post_job(
+        training_client,
+        dataset_id,
+        {**JOB_VALUES, "datasetConfig": "dataset_config.toml", "learnRate": "1e-4"},
+    )
+    assert response.status_code == 202
+    assert response.json()["warnings"] == [
+        "Unknown value 'learnRate' is ignored by profile wan-22"
+    ]
+
+
 def test_jobs_wait_for_start_and_queue_pauses_after_each_success(training_client):
     dataset_id = make_dataset(training_client)
     first = make_job(training_client, dataset_id, name="first")
@@ -421,18 +469,21 @@ def test_job_lists_and_downloads_all_lora_artifacts(training_client, paths):
         "files": [
             {
                 "name": "char_v3-000001.safetensors",
+                "path": str((output_dir / "char_v3-000001.safetensors").resolve()),
                 "size_bytes": len(expected["char_v3-000001.safetensors"]),
                 "epoch": 1,
                 "kind": "epoch",
             },
             {
                 "name": "char_v3-000002.safetensors",
+                "path": str((output_dir / "char_v3-000002.safetensors").resolve()),
                 "size_bytes": len(expected["char_v3-000002.safetensors"]),
                 "epoch": 2,
                 "kind": "epoch",
             },
             {
                 "name": "char_v3.safetensors",
+                "path": str((output_dir / "char_v3.safetensors").resolve()),
                 "size_bytes": len(expected["char_v3.safetensors"]),
                 "epoch": None,
                 "kind": "final",
@@ -496,6 +547,7 @@ def test_running_job_exposes_completed_epoch_artifacts(training_client, paths):
         "files": [
             {
                 "name": checkpoint.name,
+                "path": str(checkpoint.resolve()),
                 "size_bytes": len(b"epoch-one"),
                 "epoch": 1,
                 "kind": "epoch",

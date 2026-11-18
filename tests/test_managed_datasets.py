@@ -1568,3 +1568,223 @@ def test_delete_managed_dataset_is_blocked_while_training_job_references_it(
     assert client.delete("/api/training/jobs/managed-reference-job").status_code == 204
     assert client.delete(f"/api/datasets/{managed['id']}").status_code == 204
     assert not managed_dir.exists()
+
+
+def _finalize_simple(client, session_id, **overrides):
+    payload = {"name": "simple upload", "resolution": [512, 512], **overrides}
+    return client.post(
+        f"/api/datasets/managed/upload-sessions/{session_id}/finalize-simple",
+        json=payload,
+    )
+
+
+def _staged_names(paths, session_id):
+    session_dir = paths["data"] / "managed_uploads" / session_id
+    return sorted(path.name for path in session_dir.iterdir())
+
+
+def test_finalize_simple_derives_tokens_and_pairs_captions_by_name(client, paths):
+    session_id = _staged_session(client)
+    _stage_file(client, session_id, "first.png", b"first image", "image/png")
+    _stage_file(client, session_id, "second.jpg", b"second image", "image/jpeg")
+    _stage_file(
+        client, session_id, "first.txt", b"first caption", "text/plain", "caption"
+    )
+    _stage_file(
+        client, session_id, "second.txt", b"second caption", "text/plain", "caption"
+    )
+
+    response = _finalize_simple(
+        client, session_id, description="agent upload", num_repeats=2, batch_size=2
+    )
+
+    assert response.status_code == 201, response.text
+    created = response.json()
+    assert created["name"] == "simple upload"
+    assert created["description"] == "agent upload"
+    assert created["general"]["batch_size"] == 2
+    dataset = created["datasets"][0]
+    assert dataset["resolution"] == [512, 512]
+    assert dataset["num_repeats"] == 2
+    managed_dir = paths["data"] / "managed_datasets" / created["id"] / "dataset-1"
+    assert (managed_dir / "media" / "first.png").read_bytes() == b"first image"
+    assert (managed_dir / "media" / "second.jpg").read_bytes() == b"second image"
+    assert (managed_dir / "media" / "first.txt").read_text(encoding="utf-8") == (
+        "first caption"
+    )
+    assert (managed_dir / "media" / "second.txt").read_text(encoding="utf-8") == (
+        "second caption"
+    )
+    assert not (paths["data"] / "managed_uploads" / session_id).exists()
+    listed = client.get("/api/datasets").json()
+    assert [item["id"] for item in listed] == [created["id"]]
+
+
+def test_finalize_simple_includes_control_images(client, paths):
+    session_id = _staged_session(client)
+    _stage_file(client, session_id, "sample.jpg", b"target", "image/jpeg")
+    _stage_file(client, session_id, "sample.txt", b"caption", "text/plain", "caption")
+    _stage_file(client, session_id, "sample.png", b"control", "image/png", "control")
+
+    response = _finalize_simple(client, session_id)
+
+    assert response.status_code == 201, response.text
+    managed_dir = (
+        paths["data"] / "managed_datasets" / response.json()["id"] / "dataset-1"
+    )
+    assert (managed_dir / "media" / "sample.jpg").read_bytes() == b"target"
+    assert (managed_dir / "control" / "sample.png").read_bytes() == b"control"
+
+
+def test_finalize_simple_video_defaults_to_single_frame_head_extraction(client):
+    session_id = _staged_session(client)
+    _stage_file(client, session_id, "clip.mp4", b"video", "video/mp4")
+    _stage_file(client, session_id, "clip.txt", b"caption", "text/plain", "caption")
+
+    response = _finalize_simple(
+        client, session_id, media_type="video", resolution=[960, 544]
+    )
+
+    assert response.status_code == 201, response.text
+    dataset = response.json()["datasets"][0]
+    assert dataset["target_frames"] == [1]
+    assert dataset["frame_extraction"] == "head"
+    assert "video_directory" in dataset
+
+
+def test_finalize_simple_keeps_the_session_when_a_caption_is_missing(client, paths):
+    session_id = _staged_session(client)
+    _stage_file(client, session_id, "first.png", b"first image", "image/png")
+    _stage_file(client, session_id, "second.png", b"second image", "image/png")
+    _stage_file(
+        client, session_id, "first.txt", b"first caption", "text/plain", "caption"
+    )
+    staged = _staged_names(paths, session_id)
+
+    response = _finalize_simple(client, session_id)
+
+    assert response.status_code == 422
+    assert "every media file needs a caption" in response.json()["detail"]
+    assert _staged_names(paths, session_id) == staged
+    assert client.get("/api/datasets").json() == []
+
+    _stage_file(
+        client, session_id, "second.txt", b"second caption", "text/plain", "caption"
+    )
+    retry = _finalize_simple(client, session_id)
+
+    assert retry.status_code == 201, retry.text
+    assert not (paths["data"] / "managed_uploads" / session_id).exists()
+    assert [item["id"] for item in client.get("/api/datasets").json()] == [
+        retry.json()["id"]
+    ]
+
+
+def test_finalize_simple_keeps_the_session_when_a_caption_is_empty(client, paths):
+    session_id = _staged_session(client)
+    _stage_file(client, session_id, "sample.png", b"image", "image/png")
+    _stage_file(client, session_id, "sample.txt", b" \n", "text/plain", "caption")
+    staged = _staged_names(paths, session_id)
+
+    response = _finalize_simple(client, session_id)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Caption sidecar 'sample.txt' must not be empty"
+    assert _staged_names(paths, session_id) == staged
+    assert client.get("/api/datasets").json() == []
+
+
+def test_finalize_simple_keeps_the_session_when_the_name_is_taken(client, paths):
+    assert _managed_request(client, name="taken").status_code == 201
+    session_id = _staged_session(client)
+    _stage_file(client, session_id, "sample.png", b"image", "image/png")
+    _stage_file(client, session_id, "sample.txt", b"caption", "text/plain", "caption")
+    staged = _staged_names(paths, session_id)
+
+    response = _finalize_simple(client, session_id, name="taken")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "A dataset config named 'taken' already exists"
+    assert _staged_names(paths, session_id) == staged
+    assert len(client.get("/api/datasets").json()) == 1
+
+    retry = _finalize_simple(client, session_id, name="not taken")
+    assert retry.status_code == 201, retry.text
+
+
+@pytest.mark.parametrize(
+    ("staged_files", "overrides", "detail"),
+    [
+        (
+            [("ghost.txt", "caption")],
+            {},
+            "dataset_specs[0] must contain at least one media file",
+        ),
+        (
+            [
+                ("sample.png", "target"),
+                ("sample.txt", "caption"),
+                ("ghost.txt", "caption"),
+            ],
+            {},
+            "Caption sidecar 'ghost.txt' has no matching media file",
+        ),
+        (
+            [("sample.png", "target"), ("notes.md", "caption")],
+            {},
+            "Caption sidecar 'notes.md' must use the .txt extension",
+        ),
+        (
+            [("sample.png", "target"), ("sample.txt", "caption")],
+            {"target_frames": [1]},
+            "dataset_specs[0].target_frames only applies to video datasets",
+        ),
+        (
+            [("sample.png", "target"), ("sample.txt", "caption")],
+            {"media_type": "video"},
+            "Unsupported video file extension in dataset_specs[0]: .png",
+        ),
+    ],
+)
+def test_finalize_simple_validation_failures_keep_the_session(
+    client, paths, staged_files, overrides, detail
+):
+    session_id = _staged_session(client)
+    for filename, kind in staged_files:
+        _stage_file(client, session_id, filename, b"content", "text/plain", kind)
+    staged = _staged_names(paths, session_id)
+
+    response = _finalize_simple(client, session_id, **overrides)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == detail
+    assert _staged_names(paths, session_id) == staged
+
+
+def test_finalize_simple_rejects_a_blank_name_and_invalid_options(client, paths):
+    session_id = _staged_session(client)
+    _stage_file(client, session_id, "sample.png", b"image", "image/png")
+    _stage_file(client, session_id, "sample.txt", b"caption", "text/plain", "caption")
+    staged = _staged_names(paths, session_id)
+
+    blank = _finalize_simple(client, session_id, name="  ")
+    assert blank.status_code == 422
+    assert blank.json()["detail"] == "name must not be empty"
+
+    for overrides in ({"resolution": [512]}, {"num_repeats": 0}, {"batch_size": 0}):
+        assert _finalize_simple(client, session_id, **overrides).status_code == 422
+
+    missing_resolution = client.post(
+        f"/api/datasets/managed/upload-sessions/{session_id}/finalize-simple",
+        json={"name": "no resolution"},
+    )
+    assert missing_resolution.status_code == 422
+    assert _staged_names(paths, session_id) == staged
+
+
+def test_finalize_simple_returns_404_for_an_unknown_session(client):
+    for session_id in ("00000000-0000-4000-8000-000000000000", "not-a-session"):
+        response = _finalize_simple(client, session_id)
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Unknown upload session"

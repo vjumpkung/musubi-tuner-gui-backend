@@ -1,11 +1,15 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from app.command_builder import (
+    SERVER_VALUE_KEYS,
+    TRAIN_VALUE_FLAGS,
     ExtraArgsError,
     ValuesError,
     build_stage_argv,
+    describe_values,
     parse_extra_args,
     redact_argv,
     validate_values,
@@ -394,3 +398,163 @@ def test_h3_memory_flags():
     train = build_h3(values)["train"]
     for flag in ("--video_only", "--convrot_int8", "--prune_adaln", "--split_attn"):
         assert flag in train
+
+
+# Keys of commonDefaults in the frontend's src/components/training/profiles.ts and of
+# defaultAccelerationSettings in src/hooks/useAccelerationSettings.ts.
+FRONTEND_COMMON_VALUES = {
+    "musubiPath": "./musubi-tuner",
+    "datasetConfig": "dataset_config.toml",
+    "outputName": "your_lora_name",
+    "outputDir": "./lora_training/outputs",
+    "loggingDir": "",
+    "networkArgs": "",
+    "optimizerArgs": "",
+    "schedulerPower": "",
+    "schedulerMinRatio": "",
+    "schedulerCycles": "",
+    "seed": "42",
+    "gradientCheckpointing": True,
+    "persistentWorkers": True,
+    "huggingfaceRepoId": "",
+    "huggingfaceRepoType": "model",
+    "huggingfacePath": "",
+    "huggingfaceToken": "",
+    "huggingfaceVisibility": "private",
+    "asyncUpload": False,
+    "savePrecision": "bf16",
+    "extraArgs": "",
+}
+FRONTEND_ACCELERATION_VALUES = {
+    "dynamoBackend": "no",
+    "dynamoMode": "default",
+    "numProcesses": "1",
+    "numMachines": "1",
+    "numCpuThreadsPerProcess": "",
+}
+
+
+def test_train_value_flags_render_in_table_order():
+    values = {**WAN22_VALUES, **{key: f"v-{key}" for key, _ in TRAIN_VALUE_FLAGS}}
+    train = build_wan22(values)["train"]
+    start = train.index("--network_module") + 2
+    expected = [item for key, flag in TRAIN_VALUE_FLAGS for item in (flag, f"v-{key}")]
+    assert train[start : start + len(expected)] == expected
+
+
+def test_describe_values_maps_keys_to_flags():
+    described = describe_values(TRAINING_PROFILES["wan-22"])
+
+    assert "datasetConfig" not in described
+    assert described["musubiPath"] == {
+        "type": "string",
+        "flags": [],
+        "required": True,
+    }
+    assert described["ditHigh"] == {
+        "type": "string",
+        "flags": ["--dit_high_noise"],
+        "required": True,
+    }
+    assert described["vae"] == {"type": "string", "flags": ["--vae"], "required": True}
+    assert described["learningRate"] == {
+        "type": "string",
+        "flags": ["--learning_rate"],
+    }
+    assert described["task"]["required"] is True
+    assert described["task"]["options"] == list(
+        TRAINING_PROFILES["wan-22"].task_options
+    )
+    assert described["attention"]["options"] == ["sdpa", "xformers"]
+    assert described["savePrecision"]["options"] == ["bf16", "fp16", "fp32"]
+    assert described["gradientCheckpointing"] == {
+        "type": "boolean",
+        "flags": ["--gradient_checkpointing"],
+    }
+    # A key fed by several sources lists each flag once.
+    assert described["mixedPrecision"]["flags"] == ["--mixed_precision"]
+    assert described["fp8Base"]["type"] == "boolean"
+    json.dumps(described)
+
+
+def test_describe_values_merges_conditions_and_boolean_options():
+    h3 = describe_values(TRAINING_PROFILES["minimax-h3"])
+    assert h3["lossMethod"]["options"] == [
+        "guidance",
+        "adapter",
+        "teacher-first-last",
+        "teacher-ref",
+        "teacher-subject-ref",
+    ]
+    assert h3["task"]["flags"] == ["--task"]
+    assert h3["baseWeights"]["when"] == {"key": "lossMethod", "value": "adapter"}
+    assert h3["guidanceUncondCache"]["workspace_path"] is True
+    # A tuple condition is emitted as a JSON list.
+    assert h3["h3TimestepFocusProb"]["when"] == {
+        "key": "lossMethod",
+        "value": ["teacher-first-last", "teacher-ref", "teacher-subject-ref"],
+    }
+    assert h3["oneFrame"] == {"type": "boolean", "flags": ["--one_frame"]}
+
+    hunyuan = describe_values(TRAINING_PROFILES["hunyuan-video"])
+    assert hunyuan["fp8Llm"] == {"type": "boolean", "flags": ["--fp8_llm"]}
+    assert hunyuan["vaeTiling"] == {"type": "boolean", "flags": ["--vae_tiling"]}
+
+
+@pytest.mark.parametrize("profile", TRAINING_PROFILES.values(), ids=lambda p: p.id)
+def test_every_profile_describes_its_values(profile):
+    described = describe_values(profile)
+
+    assert "datasetConfig" not in described
+    json.dumps(described)
+    for field in (*profile.model_fields, *profile.advanced_fields):
+        assert field.key in described
+        assert described[field.key].get("required", False) is field.required
+    for key in (*FRONTEND_COMMON_VALUES, *FRONTEND_ACCELERATION_VALUES):
+        assert key in described or key in SERVER_VALUE_KEYS
+
+
+def test_frontend_default_values_produce_no_warnings():
+    profile = TRAINING_PROFILES["wan-22"]
+    values = {**WAN22_VALUES, **FRONTEND_COMMON_VALUES, **FRONTEND_ACCELERATION_VALUES}
+    assert validate_values(profile, values) == []
+    assert validate_values(profile, {**values, "skipCacheStages": False}) == []
+
+
+def test_unknown_values_are_reported_not_rejected():
+    profile = TRAINING_PROFILES["wan-22"]
+    assert validate_values(profile, WAN22_VALUES) == []
+    assert validate_values(
+        profile, {**WAN22_VALUES, "learnRate": "1e-4", "stubMode": "ok"}
+    ) == [
+        "Unknown value 'learnRate' is ignored by profile wan-22",
+        "Unknown value 'stubMode' is ignored by profile wan-22",
+    ]
+
+
+@pytest.mark.parametrize("key", ["gradientCheckpointing", "fp8Base", "asyncUpload"])
+@pytest.mark.parametrize("value", ["true", "false", "1", 1, 0])
+def test_boolean_values_must_be_booleans(key, value):
+    profile = TRAINING_PROFILES["wan-22"]
+    with pytest.raises(
+        ValuesError, match=rf"^{key} must be a JSON boolean \(true or false\)$"
+    ):
+        validate_values(profile, {**WAN22_VALUES, key: value})
+    for accepted in (True, False):
+        assert validate_values(profile, {**WAN22_VALUES, key: accepted}) == []
+
+
+def test_boolean_cache_options_are_enforced():
+    profile = TRAINING_PROFILES["hunyuan-video"]
+    values = {
+        "musubiPath": "m",
+        "dit": "d",
+        "vae": "v",
+        "textEncoder1": "t1",
+        "textEncoder2": "t2",
+        "outputName": "o",
+        "outputDir": "od",
+    }
+    assert validate_values(profile, {**values, "vaeTiling": True}) == []
+    with pytest.raises(ValuesError, match="vaeTiling"):
+        validate_values(profile, {**values, "vaeTiling": "true"})

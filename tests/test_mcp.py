@@ -1,3 +1,6 @@
+import json
+
+import mcp.types as mcp_types
 import pytest
 
 from app.download_catalog import DOWNLOAD_MODELS
@@ -5,6 +8,7 @@ from app.profiles import TRAINING_PROFILES
 from app.services import auth as auth_service
 
 PASSWORD = "mcp test password"
+UPLOAD_PATH = "/api/datasets/managed/upload-sessions/{session_id}/files"
 MCP_HEADERS = {
     "Accept": "application/json, text/event-stream",
     "Content-Type": "application/json",
@@ -20,6 +24,10 @@ ALLOWLISTED_TOOLS = {
     "get_dataset_config",
     "validate_dataset_config",
     "create_dataset_config",
+    "create_dataset_from_folder",
+    "create_dataset_upload_session",
+    "finalize_dataset_upload",
+    "cancel_dataset_upload_session",
     "get_training_queue",
     "start_training_queue",
     "pause_training_queue",
@@ -32,7 +40,11 @@ ALLOWLISTED_TOOLS = {
     "get_training_job_logs",
     "list_training_job_artifacts",
 }
-CATALOG_TOOLS = {"list_download_models", "list_training_profiles"}
+CATALOG_TOOLS = {
+    "list_download_models",
+    "list_training_profiles",
+    "get_dataset_upload_info",
+}
 # Names FastMCP would auto-generate for operations that must stay excluded.
 EXCLUDED_TOOLS = {
     "delete_dataset",
@@ -42,7 +54,11 @@ EXCLUDED_TOOLS = {
     "export_dataset",
     "import_dataset",
     "create_managed_dataset",
-    "create_managed_upload_session",
+    "create_managed_dataset_batch",
+    "read_managed_dataset_files",
+    "upload_managed_session_file",
+    "finalize_managed_upload_session",
+    "finalize_managed_update_session",
     "download_job_artifacts",
     "download_job_artifact",
     "download_job_config",
@@ -79,6 +95,35 @@ def list_tool_names(client, **kwargs) -> set[str]:
     response = rpc(client, "tools/list", {}, **kwargs)
     assert response.status_code == 200, response.text
     return {tool["name"] for tool in response.json()["result"]["tools"]}
+
+
+def initialize(client, **kwargs):
+    response = rpc(
+        client,
+        "initialize",
+        {
+            "protocolVersion": mcp_types.LATEST_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        },
+        **kwargs,
+    )
+    assert response.status_code == 200, response.text
+    return response
+
+
+def media_folder(parent, name="photos"):
+    folder = parent / name
+    folder.mkdir()
+    (folder / "a.png").write_bytes(b"image")
+    (folder / "a.txt").write_text("a caption", encoding="utf-8")
+    return folder
+
+
+def upload_info(client, **kwargs):
+    result = call_tool(client, "get_dataset_upload_info", **kwargs)
+    assert result["isError"] is False, result
+    return result["structuredContent"]
 
 
 @pytest.fixture
@@ -143,6 +188,160 @@ def test_list_training_profiles_returns_profiles(client):
         set(profile) == {"id", "name", "required_fields"} for profile in profiles
     )
     assert all(profile["required_fields"] for profile in profiles)
+
+
+def test_initialize_returns_the_workflow_instructions(client):
+    instructions = initialize(client).json()["result"]["instructions"]
+
+    assert "start_training_queue" in instructions
+    assert "create_dataset_from_folder" in instructions
+    assert "$MUSUBI_GUI_PASSWORD" in instructions
+    assert len(instructions) <= 2500
+
+
+def test_list_training_profiles_describes_one_profile_in_full(client):
+    result = call_tool(client, "list_training_profiles", {"profile_id": "wan-22"})
+
+    assert result["isError"] is False
+    (profile,) = result["structuredContent"]["result"]
+    assert set(profile) == {"id", "name", "required_fields", "fields"}
+    assert profile["id"] == "wan-22"
+    assert profile["required_fields"]
+    assert profile["fields"]["learningRate"]["flags"] == ["--learning_rate"]
+    assert profile["fields"]["gradientCheckpointing"]["type"] == "boolean"
+    assert "datasetConfig" not in profile["fields"]
+
+
+def test_list_training_profiles_rejects_an_unknown_profile_id(client):
+    result = call_tool(client, "list_training_profiles", {"profile_id": "nope"})
+
+    assert result["isError"] is True
+    message = result["content"][0]["text"]
+    assert "nope" in message
+    assert "wan-22" in message
+
+
+def test_upload_info_uses_the_forwarded_public_address(client):
+    headers = {
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": "pod-8000.proxy.runpod.net",
+    }
+
+    info = upload_info(client, headers=headers)
+
+    upload_url = f"https://pod-8000.proxy.runpod.net{UPLOAD_PATH}"
+    assert info["upload_url"] == upload_url
+    assert info["upload_url"].startswith(
+        "https://pod-8000.proxy.runpod.net/api/datasets/managed/upload-sessions/"
+    )
+    assert info["password_required"] is False
+    assert info["curl"] == (
+        f'curl -fsS -F kind=target -F "file=@image.png" {upload_url}'
+    )
+    assert "kind=caption" in info["note"]
+    assert "curl.exe" in info["note"]
+
+
+def test_upload_info_uses_the_first_forwarded_value(client):
+    headers = {
+        "X-Forwarded-Proto": "https, http",
+        "X-Forwarded-Host": "public.example, internal.example",
+    }
+
+    info = upload_info(client, headers=headers)
+
+    assert info["upload_url"] == f"https://public.example{UPLOAD_PATH}"
+
+
+def test_upload_info_falls_back_to_the_request_address(client):
+    info = upload_info(client)
+
+    assert info["upload_url"] == f"http://testserver{UPLOAD_PATH}"
+    assert "{session_id}" in info["upload_url"]
+
+
+def test_upload_info_with_a_password_never_contains_the_password(auth_client):
+    headers = {"Authorization": f"Bearer {PASSWORD}"}
+
+    result = call_tool(auth_client, "get_dataset_upload_info", headers=headers)
+    info = result["structuredContent"]
+    instructions = initialize(auth_client, headers=headers).text
+
+    assert info["password_required"] is True
+    assert '-H "Authorization: Bearer $MUSUBI_GUI_PASSWORD"' in info["curl"]
+    assert PASSWORD not in json.dumps(result)
+    assert PASSWORD not in instructions
+
+
+def test_create_dataset_from_folder_tool_creates_a_listed_dataset(client, paths):
+    folder = media_folder(paths["workspace"])
+
+    result = call_tool(
+        client,
+        "create_dataset_from_folder",
+        {"name": "mcp folder", "path": str(folder), "resolution": [512, 512]},
+    )
+
+    assert result["isError"] is False, result
+    created = result["structuredContent"]
+    assert created["media_count"] == 1
+    listed = call_tool(client, "list_dataset_configs")["structuredContent"]["result"]
+    assert [(item["id"], item["name"]) for item in listed] == [
+        (created["id"], "mcp folder")
+    ]
+
+
+def test_create_dataset_from_folder_tool_reports_a_folder_missing_on_the_server(
+    client, paths
+):
+    missing = paths["workspace"] / "not-here"
+
+    result = call_tool(
+        client,
+        "create_dataset_from_folder",
+        {"name": "mcp folder", "path": str(missing), "resolution": [512, 512]},
+    )
+
+    assert result["isError"] is True
+    assert "Folder not found on the server" in result["content"][0]["text"]
+
+
+def test_upload_session_tools_finalize_and_cancel(client):
+    session_id = call_tool(client, "create_dataset_upload_session")[
+        "structuredContent"
+    ]["id"]
+    for filename, kind, content_type in (
+        ("a.png", "target", "image/png"),
+        ("a.txt", "caption", "text/plain"),
+    ):
+        uploaded = client.post(
+            f"/api/datasets/managed/upload-sessions/{session_id}/files",
+            data={"kind": kind},
+            files={"file": (filename, b"content", content_type)},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+
+    finalized = call_tool(
+        client,
+        "finalize_dataset_upload",
+        {"session_id": session_id, "name": "mcp upload", "resolution": [512, 512]},
+    )
+
+    assert finalized["isError"] is False, finalized
+    listed = call_tool(client, "list_dataset_configs")["structuredContent"]["result"]
+    assert [item["name"] for item in listed] == ["mcp upload"]
+
+    abandoned = call_tool(client, "create_dataset_upload_session")["structuredContent"][
+        "id"
+    ]
+    arguments = {"session_id": abandoned}
+    assert (
+        call_tool(client, "cancel_dataset_upload_session", arguments)["isError"]
+        is False
+    )
+    assert (
+        call_tool(client, "cancel_dataset_upload_session", arguments)["isError"] is True
+    )
 
 
 def test_write_tools_change_queue_state(client):

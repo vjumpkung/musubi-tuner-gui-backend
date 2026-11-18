@@ -101,12 +101,18 @@ def test_success_writes_all_files(client, model, paths, monkeypatch):
     client.app.state.downloads.transport = httpx.MockTransport(handle)
     response = start(client, model, destination="models")
     assert response.status_code == 202
+    destination = paths["workspace"] / "models"
+    expected_files = [
+        str((destination / MODEL_PATH).resolve()),
+        str((destination / "vae/nested/vae.bin").resolve()),
+    ]
+    assert response.json()["files"] == expected_files
     job = finished(client, response.json()["id"])
     assert job["status"] == "completed"
     assert job["progress"] == 100
     assert job["message"] == "Download completed"
     assert job["current_file"] == "vae/nested/vae.bin"
-    destination = paths["workspace"] / "models"
+    assert job["files"] == expected_files
     assert (destination / MODEL_PATH).read_bytes() == b"model data"
     assert (destination / "vae/nested/vae.bin").read_bytes() == b"vae data"
     assert not list(destination.rglob("*.part"))
@@ -589,7 +595,6 @@ def test_catalog_sanity():
         "wan-2-2-t2v-14b",
         "wan-2-2-i2v-14b",
         "z-image-base",
-        "z-image-turbo",
         "minimax-h3-fl2va-bf16",
         "minimax-h3-fl2va-int8",
         "minimax-h3-ref2va-bf16",
