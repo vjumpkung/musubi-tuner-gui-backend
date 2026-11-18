@@ -317,7 +317,7 @@ async def create_job(payload: TrainingJobRequest, request: Request) -> dict:
     values = _normalize_values(payload.values)
     values["skipCacheStages"] = payload.skip_cache_stages
     try:
-        validate_values(profile, values)
+        warnings = validate_values(profile, values)
     except ExtraArgsError as error:
         raise HTTPException(status_code=400, detail=str(error))
     except ValuesError as error:
@@ -378,7 +378,7 @@ async def create_job(payload: TrainingJobRequest, request: Request) -> dict:
         )
 
     dataset_config_toml = render_toml(json.loads(dataset_row["config_json"]))
-    return await _insert_job(
+    job = await _insert_job(
         db,
         settings,
         runner,
@@ -389,6 +389,7 @@ async def create_job(payload: TrainingJobRequest, request: Request) -> dict:
         values=values,
         skip_cache_stages=payload.skip_cache_stages,
     )
+    return {**job, "warnings": warnings}
 
 
 @router.get("/jobs")
@@ -426,6 +427,7 @@ async def list_job_artifacts(job_id: str, request: Request) -> dict:
             files.append(
                 {
                     "name": artifact.name,
+                    "path": str(artifact),
                     "size_bytes": artifact.stat().st_size,
                     "epoch": _artifact_epoch(row, artifact),
                     "kind": _artifact_kind(row, artifact),

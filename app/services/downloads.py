@@ -42,6 +42,7 @@ class DownloadJob:
             "id": self.id,
             "script_id": self.script_id,
             "status": self.status,
+            "files": [str(target) for target in self.targets],
         }
         if self.progress is not None:
             payload["progress"] = round(min(100.0, max(0.0, self.progress)), 1)

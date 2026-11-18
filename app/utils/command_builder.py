@@ -19,6 +19,56 @@ EXTRA_ARG_TOKEN = re.compile(r"^[A-Za-z0-9_.\/=:,+()\-]+$")
 STAGE_KEYS = ("cache_latents", "cache_text_encoder", "train")
 SAVE_PRECISIONS = ("bf16", "fp16", "fp32")
 
+# (value key, train flag) pairs that _train_argv renders as "<flag> <value>", in
+# argv order.
+TRAIN_VALUE_FLAGS = (
+    ("optimizer", "--optimizer_type"),
+    ("scheduler", "--lr_scheduler"),
+    ("mixedPrecision", "--mixed_precision"),
+    ("savePrecision", "--save_precision"),
+    ("timestepSampling", "--timestep_sampling"),
+    ("weightingScheme", "--weighting_scheme"),
+    ("loggingDir", "--logging_dir"),
+    ("epochs", "--max_train_epochs"),
+    ("saveEvery", "--save_every_n_epochs"),
+    ("networkDim", "--network_dim"),
+    ("networkAlpha", "--network_alpha"),
+    ("learningRate", "--learning_rate"),
+    ("warmupSteps", "--lr_warmup_steps"),
+    ("schedulerPower", "--lr_scheduler_power"),
+    ("schedulerMinRatio", "--lr_scheduler_min_lr_ratio"),
+    ("schedulerCycles", "--lr_scheduler_num_cycles"),
+    ("blocksToSwap", "--blocks_to_swap"),
+    ("flowShift", "--discrete_flow_shift"),
+    ("seed", "--seed"),
+    ("workers", "--max_data_loader_n_workers"),
+    ("guidanceScale", "--guidance_scale"),
+    ("timestepBoundary", "--timestep_boundary"),
+    ("minTimestep", "--min_timestep"),
+    ("maxTimestep", "--max_timestep"),
+)
+BOOLEAN_TRAIN_FLAGS = (
+    ("gradientCheckpointing", "--gradient_checkpointing"),
+    ("persistentWorkers", "--persistent_data_loader_workers"),
+    ("asyncUpload", "--async_upload"),
+)
+HUGGINGFACE_VALUE_FLAGS = (
+    ("huggingfaceRepoId", "--huggingface_repo_id"),
+    ("huggingfaceRepoType", "--huggingface_repo_type"),
+    ("huggingfacePath", "--huggingface_path_in_repo"),
+    ("huggingfaceToken", "--huggingface_token"),
+    ("huggingfaceVisibility", "--huggingface_repo_visibility"),
+)
+ACCELERATE_VALUE_FLAGS = (
+    ("dynamoBackend", "--dynamo_backend"),
+    ("dynamoMode", "--dynamo_mode"),
+    ("numProcesses", "--num_processes"),
+    ("numMachines", "--num_machines"),
+    ("numCpuThreadsPerProcess", "--num_cpu_threads_per_process"),
+)
+# Values the server sets or ignores itself; never reported as unknown.
+SERVER_VALUE_KEYS = frozenset({"datasetConfig", "skipCacheStages"})
+
 
 class ExtraArgsError(ValueError):
     """An extraArgs token failed the allowlist pattern (HTTP 400)."""
@@ -55,8 +105,94 @@ def _argument(values: dict, flag: str, key: str) -> list[str]:
     return [flag, text] if text else []
 
 
-def validate_values(profile: TrainingProfile, values: dict) -> None:
-    """Check the required fields for the profile. Raises ValuesError / ExtraArgsError."""
+def describe_values(profile: TrainingProfile) -> dict[str, dict]:
+    """Every value key the profile accepts, with its type and the CLI flags it feeds."""
+    entries: dict[str, dict] = {}
+
+    def add(
+        key: str,
+        value_type: str = "string",
+        flags: tuple[str, ...] = (),
+        *,
+        required: bool = False,
+        options: tuple[str, ...] = (),
+        when: When | None = None,
+        workspace_path: bool = False,
+    ) -> None:
+        entry = entries.setdefault(key, {"type": value_type, "flags": []})
+        for flag in flags:
+            if flag not in entry["flags"]:
+                entry["flags"].append(flag)
+        if required:
+            entry["required"] = True
+        if options:
+            entry["options"] = list(options)
+        if when is not None:
+            entry["when"] = {
+                "key": when.key,
+                "value": list(when.value)
+                if isinstance(when.value, tuple)
+                else when.value,
+            }
+        if workspace_path:
+            entry["workspace_path"] = True
+
+    add("outputName", flags=("--output_name",), required=True)
+    add("outputDir", flags=("--output_dir",), required=True)
+    add("musubiPath", required=True)
+    if profile.task_options:
+        add("task", flags=("--task",), required=True, options=profile.task_options)
+    for selector in profile.selectors:
+        add(
+            selector.key,
+            flags=(selector.train_flag,) if selector.train_flag else (),
+            required=True,
+            options=selector.options,
+        )
+    for field in (*profile.model_fields, *profile.advanced_fields):
+        add(
+            field.key,
+            flags=(field.train_flag,) if field.train_flag else (),
+            required=field.required,
+            when=field.when,
+            workspace_path=field.workspace_path,
+        )
+    for option in (
+        *profile.cache_commands[0].options,
+        *profile.cache_commands[1].options,
+        *profile.train_options,
+    ):
+        if option.enabled_key is not None:
+            add(option.enabled_key, "boolean", (option.flag,))
+        elif option.key is not None and option.key != "datasetConfig":
+            add(option.key, flags=(option.flag,))
+    for key, flag in TRAIN_VALUE_FLAGS:
+        add(key, flags=(flag,))
+    add("savePrecision", options=SAVE_PRECISIONS)
+    add("networkArgs", flags=("--network_args",))
+    add("optimizerArgs", flags=("--optimizer_args",))
+    for key, flag in BOOLEAN_TRAIN_FLAGS:
+        add(key, "boolean", (flag,))
+    for memory_flag in profile.memory_flags:
+        add(memory_flag.key, "boolean", (memory_flag.flag,))
+    add(
+        "attention",
+        flags=tuple(f"--{name}" for name in profile.attention_options),
+        options=profile.attention_options,
+    )
+    for key, flag in HUGGINGFACE_VALUE_FLAGS:
+        add(key, flags=(flag,))
+    add("extraArgs")
+    for key, flag in ACCELERATE_VALUE_FLAGS:
+        add(key, flags=(flag,))
+    return entries
+
+
+def validate_values(profile: TrainingProfile, values: dict) -> list[str]:
+    """Check the values for the profile and return warnings for ignored keys.
+
+    Raises ValuesError / ExtraArgsError.
+    """
     missing = [
         field.key
         for field in profile.model_fields
@@ -94,6 +230,17 @@ def validate_values(profile: TrainingProfile, values: dict) -> None:
         )
 
     parse_extra_args(values)
+
+    described = describe_values(profile)
+    for key, value in values.items():
+        entry = described.get(key)
+        if entry and entry["type"] == "boolean" and not isinstance(value, bool):
+            raise ValuesError(f"{key} must be a JSON boolean (true or false)")
+    return [
+        f"Unknown value '{key}' is ignored by profile {profile.id}"
+        for key in values
+        if key not in described and key not in SERVER_VALUE_KEYS
+    ]
 
 
 def parse_extra_args(values: dict) -> list[str]:
@@ -164,34 +311,9 @@ def _train_argv(
             args += argument(field.train_flag, field.key)
     for option in profile.train_options:
         args += _option_argv(option, values, dataset_config_path)
-    args += [
-        "--network_module",
-        profile.network_module,
-        *argument("--optimizer_type", "optimizer"),
-        *argument("--lr_scheduler", "scheduler"),
-        *argument("--mixed_precision", "mixedPrecision"),
-        *argument("--save_precision", "savePrecision"),
-        *argument("--timestep_sampling", "timestepSampling"),
-        *argument("--weighting_scheme", "weightingScheme"),
-        *argument("--logging_dir", "loggingDir"),
-        *argument("--max_train_epochs", "epochs"),
-        *argument("--save_every_n_epochs", "saveEvery"),
-        *argument("--network_dim", "networkDim"),
-        *argument("--network_alpha", "networkAlpha"),
-        *argument("--learning_rate", "learningRate"),
-        *argument("--lr_warmup_steps", "warmupSteps"),
-        *argument("--lr_scheduler_power", "schedulerPower"),
-        *argument("--lr_scheduler_min_lr_ratio", "schedulerMinRatio"),
-        *argument("--lr_scheduler_num_cycles", "schedulerCycles"),
-        *argument("--blocks_to_swap", "blocksToSwap"),
-        *argument("--discrete_flow_shift", "flowShift"),
-        *argument("--seed", "seed"),
-        *argument("--max_data_loader_n_workers", "workers"),
-        *argument("--guidance_scale", "guidanceScale"),
-        *argument("--timestep_boundary", "timestepBoundary"),
-        *argument("--min_timestep", "minTimestep"),
-        *argument("--max_timestep", "maxTimestep"),
-    ]
+    args += ["--network_module", profile.network_module]
+    for key, flag in TRAIN_VALUE_FLAGS:
+        args += argument(flag, key)
     if _text(values, "networkArgs"):
         args += ["--network_args", *_text(values, "networkArgs").split()]
     if _text(values, "optimizerArgs"):

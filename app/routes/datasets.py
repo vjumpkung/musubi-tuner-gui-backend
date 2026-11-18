@@ -18,7 +18,12 @@ from starlette.datastructures import Headers
 
 from ..config import Settings
 from ..db import Database, utc_now
-from ..schemas.datasets import DatasetPayload, ManagedFinalizePayload
+from ..schemas.datasets import (
+    DatasetFromFolderPayload,
+    DatasetPayload,
+    ManagedFinalizePayload,
+    ManagedSimpleFinalizePayload,
+)
 from ..utils.dataset_rules import (
     JSONL_SOURCE_KEYS,
     SOURCE_KEYS,
@@ -245,6 +250,26 @@ def _available_staged_tokens(directory: Path) -> set[str]:
         if data_path.is_file():
             tokens.add(token)
     return tokens
+
+
+def _staged_tokens_by_kind(directory: Path) -> dict[str, list[str]]:
+    """Group a session's staged tokens by the kind recorded at upload time."""
+    grouped: dict[str, list[str]] = {kind: [] for kind in STAGED_FILE_KINDS}
+    for token in sorted(_available_staged_tokens(directory)):
+        _, metadata_path = _staged_token_paths(directory, token)
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HTTPException(
+                status_code=500, detail="Staged upload metadata is unavailable"
+            ) from error
+        kind = metadata.get("kind") if isinstance(metadata, dict) else None
+        if kind not in STAGED_FILE_KINDS:
+            raise HTTPException(
+                status_code=500, detail="Staged upload metadata is invalid"
+            )
+        grouped[kind].append(token)
+    return grouped
 
 
 class _StagedUploadReader:
@@ -998,6 +1023,73 @@ async def finalize_managed_upload_session(
     finally:
         await _close_staged_groups(groups)
         _discard_claimed_upload(claimed_directory)
+
+
+@router.post("/managed/upload-sessions/{session_id}/finalize-simple", status_code=201)
+async def finalize_simple_upload_session(
+    session_id: str, payload: ManagedSimpleFinalizePayload, request: Request
+) -> dict:
+    """Create a dataset from every file uploaded to an upload session.
+
+    Upload the files first: kind=target for the images or videos and kind=caption
+    for the .txt captions. Captions are paired with media by file name, so
+    photo1.png needs photo1.txt. resolution is [width, height]. If validation
+    fails (for example a media file has no caption, or the name is taken) the
+    session is kept, so you can fix the problem and call this again.
+    """
+    settings = request.app.state.settings
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="name must not be empty")
+    spec: dict = {
+        "media_type": payload.media_type,
+        "resolution": payload.resolution,
+        "num_repeats": payload.num_repeats,
+    }
+    if payload.target_frames is not None:
+        spec["target_frames"] = payload.target_frames
+
+    # Validate before claiming so a failure leaves the staged files in place.
+    async with request.app.state.managed_upload_lock:
+        directory = _staged_session_directory(settings, session_id)
+        tokens = _staged_tokens_by_kind(directory)
+        groups: list[list[UploadFile]] = []
+        try:
+            for kind in STAGED_FILE_KINDS:
+                groups.append(_open_staged_uploads(directory, tokens[kind], kind))
+            files, caption_files, control_files = groups
+            await _prepare_managed_batch_dataset(
+                spec, files, caption_files, control_files, 0
+            )
+        finally:
+            await _close_staged_groups(groups)
+    if await _name_taken(_db(request), name):
+        raise HTTPException(
+            status_code=409, detail=f"A dataset config named '{name}' already exists"
+        )
+
+    return await finalize_managed_upload_session(
+        session_id,
+        ManagedFinalizePayload(
+            name=name,
+            description=payload.description,
+            batch_size=payload.batch_size,
+            enable_bucket=payload.enable_bucket,
+            bucket_no_upscale=payload.bucket_no_upscale,
+            dataset_specs=[
+                {
+                    **spec,
+                    "file_count": len(tokens["target"]),
+                    "caption_file_count": len(tokens["caption"]),
+                    "control_file_count": len(tokens["control"]),
+                }
+            ],
+            file_tokens=tokens["target"],
+            caption_file_tokens=tokens["caption"],
+            control_file_tokens=tokens["control"],
+        ),
+        request,
+    )
 
 
 @router.put(
@@ -2798,14 +2890,14 @@ def _creatable(path: Path) -> bool:
     return ancestor.is_dir() and os.access(ancestor, os.W_OK)
 
 
-def _check_dataset_paths(dataset: dict, general: dict) -> dict:
+def _check_dataset_paths(dataset: dict, general: dict, settings: Settings) -> dict:
     source_key = next((key for key in SOURCE_KEYS if key in dataset), None)
     result: dict = {"source_key": source_key, "source_path": dataset.get(source_key)}
     if source_key is None:
         result["exists"] = False
         return result
 
-    source = Path(str(dataset[source_key]))
+    source = settings.resolve_path(str(dataset[source_key]))
     if source_key in JSONL_SOURCE_KEYS:
         result["exists"] = source.is_file()
         if result["exists"]:
@@ -2839,8 +2931,97 @@ def _check_dataset_paths(dataset: dict, general: dict) -> dict:
     cache_directory = dataset.get("cache_directory")
     if cache_directory:
         result["cache_directory"] = cache_directory
-        result["cache_directory_creatable"] = _creatable(Path(str(cache_directory)))
+        result["cache_directory_creatable"] = _creatable(
+            settings.resolve_path(str(cache_directory))
+        )
     return result
+
+
+def _folder_media(folder: Path, media_type: str) -> tuple[list[str], list[str]]:
+    """Return top-level media names and those without a same-name .txt caption."""
+    extensions = IMAGE_EXTENSIONS if media_type == "image" else VIDEO_EXTENSIONS
+    try:
+        media = sorted(
+            entry.name
+            for entry in folder.iterdir()
+            if entry.is_file() and entry.suffix.lower() in extensions
+        )
+        uncaptioned = [
+            name
+            for name in media
+            if not (folder / f"{Path(name).stem}{CAPTION_EXTENSION}").is_file()
+        ]
+    except OSError as error:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Folder cannot be read on the server: {folder}",
+        ) from error
+    return media, uncaptioned
+
+
+@router.post("/from-folder", status_code=201)
+async def create_dataset_from_folder(
+    payload: DatasetFromFolderPayload, request: Request
+) -> dict:
+    """Create a dataset config from an image or video folder on the server.
+
+    The folder must already exist on the server's machine; give an absolute path
+    or one relative to the workspace root. Every media file needs a caption file
+    with the same name and a .txt extension in the same folder (photo1.png needs
+    photo1.txt). resolution is [width, height]. If the error says "Folder not
+    found on the server", upload the files with an upload session instead.
+    """
+    settings = request.app.state.settings
+    folder = settings.resolve_path(payload.path)
+    if not folder.is_dir():
+        raise HTTPException(
+            status_code=422, detail=f"Folder not found on the server: {folder}"
+        )
+    media, uncaptioned = _folder_media(folder, payload.media_type)
+    if not media:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No {payload.media_type} files found in {folder}",
+        )
+    if uncaptioned:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{len(uncaptioned)} {payload.media_type} file(s) have no .txt "
+                f"caption: {', '.join(uncaptioned[:20])}"
+            ),
+        )
+    if payload.media_type == "image" and payload.target_frames is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="target_frames only applies to video datasets",
+        )
+
+    general = _managed_general_config(
+        payload.batch_size, payload.enable_bucket, payload.bucket_no_upscale
+    )
+    source_key = (
+        "image_directory" if payload.media_type == "image" else "video_directory"
+    )
+    dataset: dict = {
+        source_key: str(folder),
+        "cache_directory": str(folder / "cache"),
+        "resolution": payload.resolution,
+        "num_repeats": payload.num_repeats,
+    }
+    if payload.media_type == "video":
+        dataset["target_frames"] = payload.target_frames or [1]
+        dataset["frame_extraction"] = "head"
+    created = await create_dataset(
+        DatasetPayload(
+            name=payload.name,
+            description=payload.description,
+            general=general,
+            datasets=[dataset],
+        ),
+        request,
+    )
+    return {**created, "media_count": len(media)}
 
 
 @router.post("/{config_id}/validate")
@@ -2848,10 +3029,11 @@ async def validate_dataset_paths(config_id: str, request: Request) -> dict:
     row = await _get_row(_db(request), config_id)
     config = json.loads(row["config_json"])
     general = config.get("general", {})
+    settings = request.app.state.settings
     return {
         "id": row["id"],
         "datasets": [
-            {"index": index, **_check_dataset_paths(dataset, general)}
+            {"index": index, **_check_dataset_paths(dataset, general, settings)}
             for index, dataset in enumerate(config.get("datasets", []))
         ],
     }

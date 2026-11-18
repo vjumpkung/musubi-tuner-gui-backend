@@ -109,15 +109,23 @@ class Settings:
     def managed_uploads_dir(self) -> Path:
         return self.data_root / "managed_uploads"
 
+    def resolve_path(self, raw: str) -> Path:
+        """Resolve a client-supplied path without confining it to the workspace.
+
+        Absolute paths are used as given; relative paths are joined under the
+        workspace root, which is also the trainer's working directory.
+        """
+        candidate = Path(raw)
+        return (
+            candidate if candidate.is_absolute() else self.workspace_root / candidate
+        ).resolve()
+
     def resolve_inside_workspace(self, raw: str) -> Path:
         """Resolve a client-supplied path against the workspace root.
 
         Raises ValueError when the result escapes the configured root.
         """
-        candidate = Path(raw)
-        resolved = (
-            candidate if candidate.is_absolute() else self.workspace_root / candidate
-        ).resolve()
+        resolved = self.resolve_path(raw)
         if (
             resolved != self.workspace_root
             and self.workspace_root not in resolved.parents
