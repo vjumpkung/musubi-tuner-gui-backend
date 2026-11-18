@@ -248,8 +248,8 @@ back to its previous HTTP polling and refetches everything when the socket recon
 
 The backend exposes an [MCP](https://modelcontextprotocol.io/) server over Streamable HTTP at
 `/mcp` on the same port as the GUI, so an AI client such as Claude Code can inspect and drive
-the GUI: check the system, start downloads, create dataset configs, and queue and monitor
-training jobs.
+the GUI: check the system, start downloads, create datasets from a server folder or from files the
+agent uploads, and queue and monitor training jobs.
 
 With `MUSUBI_GUI_PASSWORD` set, requests must carry `Authorization: Bearer <MUSUBI_GUI_PASSWORD>`;
 without a password no header is needed. For example, with Claude Code:
@@ -262,16 +262,81 @@ claude mcp add --transport http musubi-tuner-gui http://127.0.0.1:8000/mcp --hea
 | --------- | ------------------------------------------------------------------------------------------ |
 | System    | `get_system_resources`                                                                     |
 | Downloads | `list_download_models`, `list_downloads`, `get_download`, `start_download`, `cancel_download` |
-| Datasets  | `list_dataset_configs`, `get_dataset_config`, `validate_dataset_config`, `create_dataset_config` |
+| Datasets  | `list_dataset_configs`, `get_dataset_config`, `validate_dataset_config`, `create_dataset_config`, `create_dataset_from_folder`, `create_dataset_upload_session`, `get_dataset_upload_info`, `finalize_dataset_upload`, `cancel_dataset_upload_session` |
 | Training  | `list_training_profiles`, `get_training_queue`, `start_training_queue`, `pause_training_queue`, `list_training_jobs`, `get_training_job`, `create_training_job`, `cancel_training_job`, `retry_training_job`, `reorder_training_job`, `get_training_job_logs`, `list_training_job_artifacts` |
 
 Most tools call the matching REST endpoint inside the server, so validation, errors, and
 side effects are the same as for the web UI. `list_download_models` returns the catalog bundle
 ids that `start_download` takes as `script_id`, and `list_training_profiles` returns the profile
 ids that `create_training_job` takes as `profile_id` with each profile's required `values` keys
-(`outputName`, `outputDir`, and `musubiPath` are always required as well). By design there are
-no tools that delete data or upload files, and TOML import/export and checkpoint downloads are
-not exposed.
+(`outputName`, `outputDir`, and `musubiPath` are always required as well). Pass `profile_id` to
+`list_training_profiles` to get one profile with every `values` key it accepts: its type
+(`string` or `boolean`), the CLI flags it feeds, its options, and any condition on it.
+`create_training_job` rejects a boolean sent as a string (use JSON `true` or `false`) and returns
+`warnings` that name `values` keys the profile ignores. `get_download` and `list_downloads`
+report `files`, the absolute paths of the downloaded files, and `list_training_job_artifacts`
+returns an absolute `path` for each artifact. Relative paths in dataset and job values resolve
+under the workspace root; `musubiPath`, `outputDir`, and `loggingDir` must stay inside it.
+
+The server also sends the agent a short workflow guide in the MCP `initialize` response. Every
+finished, failed, or cancelled job pauses the queue, as does each enqueue, so call
+`start_training_queue` for each job and poll `get_training_job` and `get_training_job_logs`.
+
+By design no tool deletes data, apart from `cancel_dataset_upload_session` discarding a staged
+upload, and no tool carries file bytes: files are uploaded with curl. TOML import/export and
+checkpoint downloads are not exposed.
+
+### Creating a dataset
+
+Every media file needs a `.txt` caption with the same name (`photo1.png` and `photo1.txt`). Both
+flows take `name`, `resolution` as `[width, height]`, and optionally `media_type` (`image` or
+`video`), `num_repeats`, `batch_size`, `enable_bucket`, `bucket_no_upscale`, and, for video,
+`target_frames`.
+
+- **Folder on the server** (a local install, or files already on the pod): call
+  `create_dataset_from_folder` with `path`, an absolute path or one relative to the workspace
+  root. The dataset points at that folder and nothing is copied. If the error says
+  `Folder not found on the server`, the files are on the agent's machine; use the upload flow.
+- **Upload from the agent's machine** (a cloud pod, or any remote server):
+  1. `create_dataset_upload_session` returns the session `id`.
+  2. `get_dataset_upload_info` returns `upload_url`, `password_required`, and a ready `curl`
+     command. The URL comes from `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sets
+     them, and from the MCP request otherwise. If it is unreachable, use the origin of the MCP
+     server URL.
+  3. The agent uploads every file with curl, `kind=target` for the media and `kind=caption` for
+     the captions. File bytes never go through MCP.
+  4. `finalize_dataset_upload` takes the session id and the dataset options and creates the
+     dataset from every uploaded file. If it reports a problem, such as a media file without a
+     caption or a name already in use, the session is kept, so fix it and call it again.
+     `cancel_dataset_upload_session` discards the session.
+
+```bash
+curl -fsS -H "Authorization: Bearer $MUSUBI_GUI_PASSWORD" \
+  -F kind=target -F "file=@photo1.png" \
+  https://<host>/api/datasets/managed/upload-sessions/<session_id>/files
+curl -fsS -H "Authorization: Bearer $MUSUBI_GUI_PASSWORD" \
+  -F kind=caption -F "file=@photo1.txt" \
+  https://<host>/api/datasets/managed/upload-sessions/<session_id>/files
+```
+
+Without a password, leave out the `-H` option. On Windows PowerShell use `curl.exe` and
+`$env:MUSUBI_GUI_PASSWORD`.
+
+When a password is set, put `MUSUBI_GUI_PASSWORD` in the agent's shell environment so curl can
+read it, and never print its value. The MCP client config can reference the same variable instead
+of holding the password, for example in a Claude Code `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "musubi-tuner-gui": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": { "Authorization": "Bearer ${MUSUBI_GUI_PASSWORD}" }
+    }
+  }
+}
+```
 
 ## Tests
 
