@@ -85,6 +85,14 @@ class Settings:
         )
     )
 
+    # Unset or blank disables password authentication. Never log or echo this.
+    password: str | None = field(
+        default_factory=lambda: (
+            os.environ.get("MUSUBI_GUI_PASSWORD", "").strip() or None
+        ),
+        repr=False,
+    )
+
     @property
     def database_path(self) -> Path:
         return self.data_root / "musubi_gui.db"

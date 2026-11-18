@@ -15,6 +15,8 @@ from ..db import Database, utc_now
 from ..profiles import TRAINING_PROFILES
 from ..utils.command_builder import build_stage_argv, redact_argv
 from ..utils.process import spawn, terminate_tree
+from ..utils.training_jobs import job_response
+from .realtime import RealtimeHub
 
 QUEUE_STATE_KEY = "training_queue_state"
 MAX_LOG_BYTES = 50 * 1024 * 1024
@@ -76,9 +78,12 @@ def parse_progress(line: str, progress: dict) -> bool:
 
 
 class QueueRunner:
-    def __init__(self, db: Database, settings: Settings):
+    def __init__(
+        self, db: Database, settings: Settings, events: RealtimeHub | None = None
+    ):
         self.db = db
         self.settings = settings
+        self.events = events
         self.queue_running = asyncio.Event()
         self.wake = asyncio.Event()
         # Serializes pause/start, claiming, cancellation, and reorder decisions
@@ -97,6 +102,43 @@ class QueueRunner:
     def state(self) -> str:
         return "running" if self.queue_running.is_set() else "paused"
 
+    async def queue_snapshot(self) -> dict:
+        queued_row = await self.db.fetch_one(
+            "SELECT COUNT(*) AS n FROM training_jobs WHERE status = 'queued'"
+        )
+        running_row = await self.db.fetch_one(
+            "SELECT id FROM training_jobs WHERE status = 'running' LIMIT 1"
+        )
+        return {
+            "state": self.state,
+            "queued": queued_row["n"] if queued_row else 0,
+            "running_job_id": running_row["id"] if running_row else None,
+        }
+
+    async def publish_job(self, job_id: str, *, queue: bool = True) -> None:
+        if self.events is None:
+            return
+        row = await self.db.fetch_one(
+            "SELECT * FROM training_jobs WHERE id = ?", (job_id,)
+        )
+        if row is not None:
+            self.events.publish("job:update", job_response(row))
+        if queue:
+            await self.publish_queue()
+
+    async def publish_queue(self) -> None:
+        if self.events is None:
+            return
+        self.events.publish("queue:update", await self.queue_snapshot())
+
+    def publish_jobs_changed(self) -> None:
+        if self.events is not None:
+            self.events.publish("jobs:changed", {})
+
+    def publish_job_removed(self, job_id: str) -> None:
+        if self.events is not None:
+            self.events.publish("job:removed", {"id": job_id})
+
     async def set_state(self, state: str) -> None:
         async with self.claim_lock:
             await self.db.set_setting(QUEUE_STATE_KEY, state)
@@ -105,6 +147,7 @@ class QueueRunner:
                 self.wake.set()
             else:
                 self.queue_running.clear()
+            await self.publish_queue()
 
     async def cancel_current(self) -> None:
         """Terminate the currently running job's process tree (cancel endpoint)."""
@@ -151,6 +194,8 @@ class QueueRunner:
         if not await self._claim_job(job_id, log_path):
             return
         await renumber_queue(self.db)
+        await self.publish_job(job_id)
+        self.publish_jobs_changed()
 
         if not snapshot_path.is_file():
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,7 +246,7 @@ class QueueRunner:
                     return
                 argv = argv_by_stage[stage["key"]]
                 command_text = self._redact_output(" ".join(redact_argv(argv)), values)
-                self._log(log_file, f"=== stage {stage['key']}: {command_text}")
+                self._log(log_file, job_id, f"=== stage {stage['key']}: {command_text}")
 
                 try:
                     self.current_process = await spawn(
@@ -224,7 +269,7 @@ class QueueRunner:
                 assert self.current_process.stdout is not None
                 async for line in _iter_lines(self.current_process.stdout):
                     safe_line = self._redact_output(line, values)
-                    self._log(log_file, safe_line)
+                    self._log(log_file, job_id, safe_line)
                     last_lines.append(safe_line)
                     if stage["key"] == "train" and parse_progress(line, progress):
                         now = asyncio.get_running_loop().time()
@@ -234,6 +279,7 @@ class QueueRunner:
                                 "UPDATE training_jobs SET progress_json = ? WHERE id = ?",
                                 (json.dumps(progress), job_id),
                             )
+                            await self.publish_job(job_id, queue=False)
 
                 return_code = await self.current_process.wait()
                 self.current_process = None
@@ -268,6 +314,7 @@ class QueueRunner:
             (utc_now(), json.dumps(stages), json.dumps(progress), job_id),
         )
         self.current_job_id = None
+        await self.publish_job(job_id)
 
     async def _claim_job(self, job_id: str, log_path: Path) -> bool:
         """Atomically claim a queued job while respecting pause and cancellation."""
@@ -297,10 +344,14 @@ class QueueRunner:
             self.current_job_id = None
             self.current_process = None
 
-    def _log(self, log_file, line: str) -> None:
-        if log_file.tell() < MAX_LOG_BYTES:
-            log_file.write(line.encode("utf-8", errors="replace") + b"\n")
-            log_file.flush()
+    def _log(self, log_file, job_id: str, line: str) -> None:
+        offset = log_file.tell()
+        if offset >= MAX_LOG_BYTES:
+            return
+        log_file.write(line.encode("utf-8", errors="replace") + b"\n")
+        log_file.flush()
+        if self.events is not None:
+            self.events.publish_log(job_id, offset, log_file.tell(), line + "\n")
 
     @staticmethod
     def _redact_output(line: str, values: dict) -> str:
@@ -326,6 +377,8 @@ class QueueRunner:
         await self.db.connection.commit()
         updated = cursor.rowcount == 1
         await cursor.close()
+        if updated:
+            await self.publish_job(job_id, queue=False)
         return updated
 
     async def _fail_job(
@@ -357,6 +410,7 @@ class QueueRunner:
                 job_id,
             ),
         )
+        await self.publish_job(job_id)
 
 
 async def renumber_queue(db: Database) -> None:

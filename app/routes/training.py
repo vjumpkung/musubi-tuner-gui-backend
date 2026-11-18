@@ -24,6 +24,7 @@ from ..utils.command_builder import (
     condition_matches,
     validate_values,
 )
+from ..utils.training_jobs import job_response
 from .datasets import render_toml
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
@@ -53,31 +54,6 @@ def _runner(request: Request) -> QueueRunner:
 
 def _settings(request: Request) -> Settings:
     return request.app.state.settings
-
-
-def _job_response(row) -> dict:
-    progress = json.loads(row["progress_json"]) if row["progress_json"] else {}
-    return {
-        "id": row["id"],
-        "name": row["name"],
-        "profile_id": row["profile_id"],
-        "dataset_config_id": row["dataset_config_id"],
-        "status": row["status"],
-        "queue_position": row["queue_position"],
-        "current_stage": row["current_stage"],
-        "stages": json.loads(row["stages_json"]),
-        "progress": {
-            "epoch": progress.get("epoch"),
-            "total_epochs": progress.get("total_epochs"),
-            "step": progress.get("step"),
-            "total_steps": progress.get("total_steps"),
-            "percent": progress.get("percent"),
-        },
-        "error": row["error"],
-        "created_at": row["created_at"],
-        "started_at": row["started_at"],
-        "finished_at": row["finished_at"],
-    }
 
 
 async def _get_job(db: Database, job_id: str):
@@ -232,37 +208,23 @@ def _normalize_values(values: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-async def _queue_object(db: Database, runner: QueueRunner) -> dict:
-    queued_row = await db.fetch_one(
-        "SELECT COUNT(*) AS n FROM training_jobs WHERE status = 'queued'"
-    )
-    running_row = await db.fetch_one(
-        "SELECT id FROM training_jobs WHERE status = 'running' LIMIT 1"
-    )
-    return {
-        "state": runner.state,
-        "queued": queued_row["n"] if queued_row else 0,
-        "running_job_id": running_row["id"] if running_row else None,
-    }
-
-
 @router.get("/queue")
 async def read_queue(request: Request) -> dict:
-    return await _queue_object(_db(request), _runner(request))
+    return await _runner(request).queue_snapshot()
 
 
 @router.post("/queue/start")
 async def start_queue(request: Request) -> dict:
     runner = _runner(request)
     await runner.set_state("running")
-    return await _queue_object(_db(request), runner)
+    return await runner.queue_snapshot()
 
 
 @router.post("/queue/pause")
 async def pause_queue(request: Request) -> dict:
     runner = _runner(request)
     await runner.set_state("paused")
-    return await _queue_object(_db(request), runner)
+    return await runner.queue_snapshot()
 
 
 async def _insert_job(
@@ -331,7 +293,8 @@ async def _insert_job(
         shutil.rmtree(snapshot_path.parent, ignore_errors=True)
         raise
     runner.wake.set()
-    return _job_response(await _get_job(db, job_id))
+    await runner.publish_job(job_id)
+    return job_response(await _get_job(db, job_id))
 
 
 @router.post("/jobs", status_code=202)
@@ -443,12 +406,12 @@ async def list_jobs(
         rows = await _db(request).fetch_all(
             "SELECT * FROM training_jobs ORDER BY created_at DESC, id"
         )
-    return [_job_response(row) for row in rows]
+    return [job_response(row) for row in rows]
 
 
 @router.get("/jobs/{job_id}")
 async def read_job(job_id: str, request: Request) -> dict:
-    return _job_response(await _get_job(_db(request), job_id))
+    return job_response(await _get_job(_db(request), job_id))
 
 
 @router.get("/jobs/{job_id}/artifacts")
@@ -570,7 +533,7 @@ async def cancel_job(job_id: str, request: Request) -> dict:
         status = row["status"]
 
         if status == "cancelled":
-            return _job_response(row)
+            return job_response(row)
         if status in {"completed", "failed"}:
             raise HTTPException(
                 status_code=409, detail=f"A {status} job can no longer be cancelled"
@@ -598,11 +561,15 @@ async def cancel_job(job_id: str, request: Request) -> dict:
                 (utc_now(), job_id),
             )
             await renumber_queue(db)
+    # Publish before cancel_current(), which can take several seconds.
+    await runner.publish_job(job_id)
+    if status == "queued":
+        runner.publish_jobs_changed()
     if terminate_running:
         await runner.cancel_current()
     else:
         await runner.set_state("paused")
-    return _job_response(await _get_job(db, job_id))
+    return job_response(await _get_job(db, job_id))
 
 
 @router.post("/jobs/{job_id}/retry", status_code=202)
@@ -653,17 +620,20 @@ async def reorder_job(job_id: str, payload: ReorderRequest, request: Request) ->
                     (position, item_id),
                 )
             await db.connection.commit()
-    return _job_response(await _get_job(db, job_id))
+    runner.publish_jobs_changed()
+    return job_response(await _get_job(db, job_id))
 
 
 @router.delete("/jobs/{job_id}", status_code=204)
 async def delete_job(job_id: str, request: Request) -> Response:
-    db, settings = _db(request), _settings(request)
+    db, settings, runner = _db(request), _settings(request), _runner(request)
     row = await _get_job(db, job_id)
     if row["status"] not in TERMINAL_STATUSES:
         raise HTTPException(status_code=409, detail="Cancel the job before deleting it")
 
     await db.execute("DELETE FROM training_jobs WHERE id = ?", (job_id,))
+    runner.publish_job_removed(job_id)
+    await runner.publish_queue()
     if row["log_path"]:
         Path(row["log_path"]).unlink(missing_ok=True)
     snapshot_dir = settings.jobs_dir / job_id

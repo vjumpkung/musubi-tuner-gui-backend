@@ -23,6 +23,7 @@ def make_client(paths, monkeypatch):
     monkeypatch.setenv("MUSUBI_GUI_DATA_ROOT", str(paths["data"]))
     monkeypatch.setenv("MUSUBI_GUI_WORKSPACE_ROOT", str(paths["workspace"]))
     monkeypatch.setenv("MUSUBI_GUI_WEB_DIR", str(paths["workspace"] / "no-web"))
+    monkeypatch.delenv("MUSUBI_GUI_PASSWORD", raising=False)
 
     from app.main import create_app
 
