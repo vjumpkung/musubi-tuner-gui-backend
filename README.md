@@ -39,8 +39,10 @@ inside the app, and multiple workers would double-execute jobs.
 
 ## Run locally on Windows
 
-`install.bat` and `start.bat` set up and run the GUI on a Windows PC with an NVIDIA GPU. The GUI
-opens in its own desktop window, so there is no uvicorn command to type.
+`install.bat` and `start.bat` live in the
+[musubi-tuner-gui](https://github.com/vjumpkung/musubi-tuner-gui) workspace repository and set up
+and run the GUI on a Windows PC with an NVIDIA GPU. The GUI opens in its own desktop window, so
+there is no uvicorn command to type.
 
 Requirements:
 
@@ -54,28 +56,34 @@ Requirements:
 own Python 3.12 for the backend and trainer environments, so a Python already on `PATH` is not
 used and does not need to be installed.
 
-The parent folder of this repository becomes the workspace root (`MUSUBI_GUI_WORKSPACE_ROOT`), so
-use a short ASCII path such as `C:\musubi`:
+The folder you clone the workspace repository into becomes the workspace root
+(`MUSUBI_GUI_WORKSPACE_ROOT`), so use a short ASCII path such as `C:\musubi`. `install.bat` clones
+this repository, the frontend, and the trainer into it:
 
 ```text
-C:\musubi\
+C:\musubi\                     the musubi-tuner-gui workspace repository
+  install.bat, start.bat
   musubi-tuner-gui-backend\    this repository
-  musubi-tuner-gui-frontend\   cloned by install.bat to build the web UI
+  musubi-tuner-gui-frontend\   cloned to build the web UI
   musubi-tuner\                the trainer, with its own .venv
 ```
 
 ```bat
-mkdir C:\musubi
+git clone https://github.com/vjumpkung/musubi-tuner-gui.git C:\musubi
 cd C:\musubi
-git clone https://github.com/vjumpkung/musubi-tuner-gui-backend.git
-cd musubi-tuner-gui-backend
 install.bat
 ```
 
-`install.bat` sets up the backend environment (including the `desktop` extra), builds the web UI
-into `web\`, clones and installs musubi-tuner with PyTorch (cu128 wheels) in
-`..\musubi-tuner\.venv`, and then starts the GUI. Steps that are already done are skipped, so it
-is safe to run again. Later, start the GUI with `start.bat`.
+`install.bat` clones this repository when `musubi-tuner-gui-backend\` is missing, sets up the
+backend environment (including the `desktop` extra), builds the web UI into `web\`, clones and
+installs musubi-tuner with PyTorch (cu128 wheels) in `musubi-tuner\.venv`, and then starts the
+GUI. Steps that are already done are skipped, so it is safe to run again. Later, start the GUI with
+`start.bat` in the workspace root. To update, run `git pull` in the workspace root, in
+`musubi-tuner-gui-backend` and in `musubi-tuner-gui-frontend`, then
+`install.bat --rebuild-frontend`. An existing install made with the old layout
+(`C:\musubi\musubi-tuner-gui-backend` with the scripts inside it) keeps working once the root
+`install.bat` and `start.bat` are placed in `C:\musubi`; the existing `.venv`, `web\`, `data\` and
+`musubi-tuner\` are reused.
 
 | `install.bat` option | Effect                                                          |
 | -------------------- | --------------------------------------------------------------- |
@@ -94,7 +102,7 @@ Set `TORCH_INDEX_URL` before running `install.bat` to use another PyTorch wheel 
 
 `start.bat` passes its arguments to `python -m app.launcher`. It also sets
 `MUSUBI_GUI_WORKSPACE_ROOT` to the workspace root (unless already set) and puts
-`..\musubi-tuner\.venv\Scripts` first on `PATH`, so training jobs run with the trainer's `python`
+`musubi-tuner\.venv\Scripts` first on `PATH`, so training jobs run with the trainer's `python`
 and `accelerate`. For that reason it starts the backend with its own `.venv\Scripts\python.exe`
 directly instead of `uv run`, and the backend resolves bare `python`/`accelerate` against `PATH`
 itself, because Windows would otherwise look in the backend interpreter's folder first.
