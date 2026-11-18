@@ -12,6 +12,8 @@ rem This folder is the backend repository. Its parent folder is the workspace:
 rem the web UI source goes to ..\musubi-tuner-gui-frontend and the trainer to
 rem ..\musubi-tuner (with its own .venv). Requires git, and Node 20.19+ for the
 rem web UI build. uv is installed automatically when it is missing.
+rem Python 3.12 is installed and managed by uv; a Python found on PATH is never
+rem used for the backend or trainer environments.
 chcp 65001 >nul
 setlocal EnableExtensions
 
@@ -37,7 +39,7 @@ echo Workspace root: %ROOT%
 
 rem --- 1. uv -------------------------------------------------------------
 echo.
-echo [1/5] Checking uv...
+echo [1/5] Checking uv and Python 3.12...
 where uv >nul 2>nul
 if not errorlevel 1 goto :have_uv
 echo uv was not found; installing it...
@@ -47,6 +49,9 @@ set "PATH=%USERPROFILE%\.local\bin;%PATH%"
 where uv >nul 2>nul
 if errorlevel 1 goto :fail_uv
 :have_uv
+echo Installing uv-managed Python 3.12 (a Python found on PATH is not used)...
+call uv python install 3.12
+if errorlevel 1 goto :fail
 
 rem --- 2. git ------------------------------------------------------------
 echo.
@@ -59,7 +64,7 @@ echo.
 echo [3/5] Setting up the backend environment...
 cd /d "%B%"
 if errorlevel 1 goto :fail
-call uv sync --python 3.12 --frozen --no-dev --extra desktop
+call uv sync --python 3.12 --managed-python --frozen --no-dev --extra desktop
 if errorlevel 1 goto :fail
 
 rem --- 4. web UI -----------------------------------------------------------
@@ -102,7 +107,7 @@ if exist "%ROOT%\musubi-tuner" goto :have_trainer_src
 git clone https://github.com/kohya-ss/musubi-tuner.git "%ROOT%\musubi-tuner"
 if errorlevel 1 goto :fail
 :have_trainer_src
-call uv venv "%ROOT%\musubi-tuner\.venv" --python 3.12
+call uv venv "%ROOT%\musubi-tuner\.venv" --python 3.12 --managed-python
 if errorlevel 1 goto :fail
 call uv pip install --python "%TRAINER_PY%" torch==2.11.0 torchvision==0.26.0 --index-url "%TORCH_INDEX_URL%"
 if errorlevel 1 goto :fail

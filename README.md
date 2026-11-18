@@ -50,8 +50,9 @@ Requirements:
   not needed once `web\index.html` exists.
 - Several GB of free disk space for PyTorch and the other trainer dependencies.
 
-[uv](https://docs.astral.sh/uv/) is installed automatically when it is missing, and it fetches
-Python 3.12 for the backend and trainer environments.
+[uv](https://docs.astral.sh/uv/) is installed automatically when it is missing. It installs its
+own Python 3.12 for the backend and trainer environments, so a Python already on `PATH` is not
+used and does not need to be installed.
 
 The parent folder of this repository becomes the workspace root (`MUSUBI_GUI_WORKSPACE_ROOT`), so
 use a short ASCII path such as `C:\musubi`:
