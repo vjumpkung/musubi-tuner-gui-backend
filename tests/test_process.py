@@ -51,3 +51,15 @@ async def test_spawn_leaves_absolute_path_untouched(monkeypatch, tmp_path, captu
     await process.spawn([sys.executable, "-c", "pass"], tmp_path)
 
     assert captured["argv"] == [sys.executable, "-c", "pass"]
+
+
+async def test_spawn_forces_utf8_stdio_unless_env_overrides(tmp_path, captured):
+    await process.spawn([sys.executable, "-c", "pass"], tmp_path)
+
+    assert captured["kwargs"]["env"]["PYTHONIOENCODING"] == "utf-8"
+
+    await process.spawn(
+        [sys.executable, "-c", "pass"], tmp_path, {"PYTHONIOENCODING": "latin-1"}
+    )
+
+    assert captured["kwargs"]["env"]["PYTHONIOENCODING"] == "latin-1"

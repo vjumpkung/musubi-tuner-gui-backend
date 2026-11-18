@@ -76,11 +76,11 @@ install.bat
 
 `install.bat` clones this repository when `musubi-tuner-gui-backend\` is missing, sets up the
 backend environment (including the `desktop` extra), builds the web UI into `web\`, clones and
-installs musubi-tuner with PyTorch (cu128 wheels) in `musubi-tuner\.venv`, and then starts the
-GUI. Steps that are already done are skipped, so it is safe to run again. Later, start the GUI with
-`start.bat` in the workspace root. To update, run `git pull` in the workspace root, in
-`musubi-tuner-gui-backend` and in `musubi-tuner-gui-frontend`, then
-`install.bat --rebuild-frontend`. An existing install made with the old layout
+installs musubi-tuner with PyTorch (cu128 wheels), triton-windows and SageAttention in
+`musubi-tuner\.venv`, and then starts the GUI. Steps that are already done are skipped, so it is
+safe to run again. Later, start the GUI with `start.bat` in the workspace root. To update, run
+`git pull` in the workspace root, in `musubi-tuner-gui-backend` and in `musubi-tuner-gui-frontend`,
+then `install.bat --rebuild-frontend`. An existing install made with the old layout
 (`C:\musubi\musubi-tuner-gui-backend` with the scripts inside it) keeps working once the root
 `install.bat` and `start.bat` are placed in `C:\musubi`; the existing `.venv`, `web\`, `data\` and
 `musubi-tuner\` are reused.

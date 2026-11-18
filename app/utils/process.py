@@ -34,7 +34,12 @@ async def spawn(
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
-    merged_env = {**os.environ, "PYTHONUNBUFFERED": "1", **(env or {})}
+    merged_env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONIOENCODING": "utf-8",
+        **(env or {}),
+    }
     return await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd),
