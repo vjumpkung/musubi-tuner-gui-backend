@@ -499,27 +499,6 @@ DOWNLOAD_MODELS: dict[str, DownloadModel] = {
             ],
         ),
         DownloadModel(
-            id="z-image-turbo",
-            name="Z Image Turbo",
-            files=[
-                _hf(
-                    "Comfy-Org/z_image_turbo",
-                    "split_files/diffusion_models/z_image_turbo_bf16.safetensors",
-                    "diffusion_models/z_image_turbo_bf16.safetensors",
-                ),
-                _hf(
-                    "Comfy-Org/z_image_turbo",
-                    "split_files/vae/ae.safetensors",
-                    "vae/ae.safetensors",
-                ),
-                _hf(
-                    "Comfy-Org/z_image_turbo",
-                    "split_files/text_encoders/qwen_3_4b.safetensors",
-                    "text_encoders/qwen_3_4b.safetensors",
-                ),
-            ],
-        ),
-        DownloadModel(
             id="minimax-h3-fl2va-bf16",
             name="MiniMax H3 FL2VA BF16",
             files=[
