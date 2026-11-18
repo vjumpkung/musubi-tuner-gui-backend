@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
@@ -15,6 +16,9 @@ from fastapi import HTTPException
 from ..config import Settings
 from ..download_catalog import DOWNLOAD_MODELS
 from ..schemas.downloads import DownloadModel
+from .realtime import RealtimeHub
+
+PROGRESS_PUBLISH_INTERVAL_SECONDS = 0.5
 
 
 @dataclass
@@ -31,6 +35,7 @@ class DownloadJob:
     targets: tuple[Path, ...] = ()
     started: bool = False
     cancel_requested: bool = False
+    last_publish: float = 0.0
 
     def to_response(self) -> dict:
         payload: dict = {
@@ -50,8 +55,9 @@ class DownloadJob:
 
 
 class DownloadManager:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, events: RealtimeHub | None = None):
         self.settings = settings
+        self.events = events
         self.transport: httpx.AsyncBaseTransport | None = None
         self.jobs: dict[str, DownloadJob] = {}
         self.reservations: dict[Path, str] = {}
@@ -64,6 +70,11 @@ class DownloadManager:
 
     def list_jobs(self) -> list[DownloadJob]:
         return list(reversed(self.jobs.values()))
+
+    def _publish(self, job: DownloadJob) -> None:
+        job.last_publish = time.monotonic()
+        if self.events is not None:
+            self.events.publish("download:update", job.to_response())
 
     def start(
         self, script_id: str, destination_raw: str, hf_token: str | None = None
@@ -98,6 +109,7 @@ class DownloadManager:
             self.reservations[target] = job.id
         token = hf_token or os.environ.get("HF_TOKEN")
         job.task = asyncio.create_task(self._run(job, model, token))
+        self._publish(job)
         return job
 
     def _release(self, job: DownloadJob) -> None:
@@ -111,6 +123,7 @@ class DownloadManager:
         job.started = True
         try:
             job.status = "running"
+            self._publish(job)
             async with httpx.AsyncClient(
                 transport=self.transport,
                 follow_redirects=True,
@@ -121,6 +134,7 @@ class DownloadManager:
                 for index, file in enumerate(model.files):
                     job.current_file = file.path
                     job.message = f"Downloading {file.path} ({index + 1}/{count})"
+                    self._publish(job)
                     target = job.destination / file.path
                     temporary = target.parent / f".{target.name}.{job.id}.part"
                     created = False
@@ -175,6 +189,11 @@ class DownloadManager:
                                     job.progress = min(
                                         (index + fraction) / count * 100, 99.9
                                     )
+                                    if (
+                                        time.monotonic() - job.last_publish
+                                        >= PROGRESS_PUBLISH_INTERVAL_SECONDS
+                                    ):
+                                        self._publish(job)
                             if expected is not None and written != expected:
                                 job.error = f"Incomplete download for {file.path}"
                                 return
@@ -207,6 +226,7 @@ class DownloadManager:
                 job.status = "failed"
                 job.message = None
             self._release(job)
+            self._publish(job)
 
     async def cancel(self, job_id: str) -> DownloadJob:
         job = self.get(job_id)
@@ -226,6 +246,7 @@ class DownloadManager:
                     await asyncio.shield(job.task)
             if not job.started:
                 self._release(job)
+        self._publish(job)
         return job
 
     async def shutdown(self) -> None:

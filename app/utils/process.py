@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
 import subprocess
 from pathlib import Path
@@ -19,6 +20,15 @@ async def spawn(
     argv: list[str], cwd: Path, env: dict[str, str] | None = None
 ) -> asyncio.subprocess.Process:
     """Spawn argv in its own process group with combined stdout/stderr."""
+    # Resolve a bare program name against PATH ourselves: on Windows,
+    # CreateProcess searches the parent executable's directory before PATH, so a
+    # bare ``python`` would run the backend's interpreter instead of the one the
+    # trainer environment put on PATH.
+    if not os.path.isabs(argv[0]):
+        resolved = shutil.which(argv[0])
+        if resolved is None:
+            raise OSError(f"{argv[0]} was not found on PATH")
+        argv = [resolved, *argv[1:]]
     kwargs: dict = {}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP

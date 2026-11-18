@@ -2753,6 +2753,10 @@ async def delete_dataset(config_id: str, request: Request) -> Response:
                 (config_id,),
             )
             await db.connection.commit()
+    # ON DELETE SET NULL may have cleared training_jobs.dataset_config_id.
+    realtime = getattr(request.app.state, "realtime", None)
+    if realtime is not None:
+        realtime.publish("jobs:changed", {})
     return Response(status_code=204)
 
 
